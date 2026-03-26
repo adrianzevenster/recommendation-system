@@ -1,0 +1,264 @@
+@startuml
+' Detailed architecture for recommendation_system_sim
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam defaultFontName Arial
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam wrapWidth 220
+skinparam maxMessageSize 180
+skinparam linetype ortho
+skinparam ArrowThickness 1
+skinparam packageTitleFontStyle bold
+skinparam component {
+  BackgroundColor #F8F9FA
+  BorderColor #2F4F4F
+}
+skinparam database {
+  BackgroundColor #FFF8DC
+  BorderColor #8B7D6B
+}
+skinparam queue {
+  BackgroundColor #F5F5FF
+  BorderColor #6A5ACD
+}
+skinparam cloud {
+  BackgroundColor #F0FFF0
+  BorderColor #2E8B57
+}
+skinparam note {
+  BackgroundColor #FFFFE0
+  BorderColor #BDB76B
+}
+
+title Simulated Real-Time Recommendation System - Detailed Architecture
+caption Derived from code in recommendation_system_sim
+
+actor "API Client / Frontend" as Client
+actor "Synthetic Viewer Simulator" as SimUser
+
+package "Docker Compose Runtime" {
+
+  package "Shared Library: common/*" as Common {
+    component "config.py\nPurpose: central env-driven settings for\nPostgres, Redis, Kafka, MinIO, OTEL, API, metrics" as CommonConfig
+    component "db.py\nPurpose: SQLAlchemy engine + SessionLocal\nshared by seeder, generator, processor, trainer, API" as CommonDB
+    component "models.py\nPurpose: canonical operational schema\nUser, Item, Interaction, ItemNeighbor, TrendingItem, ModelVersion" as CommonModels
+    component "redis_client.py\nPurpose: shared Redis connection factory" as CommonRedis
+    component "logging_utils.py\nPurpose: JSON structured logs with service tagging" as CommonLogging
+    component "metrics.py\nPurpose: shared Prometheus metrics definitions" as CommonMetrics
+    component "telemetry.py\nPurpose: OpenTelemetry tracer setup and\nFastAPI instrumentation" as CommonTelemetry
+    component "utils.py\nPurpose: helper utilities\n(now_utc, deterministic_score, weighted_choice)\nCurrently peripheral to main runtime flow" as CommonUtils
+  }
+
+  package "Services" {
+    component "Seeder\nservices/seeder/app.py\nPurpose: bootstrap demo users and catalog\ninto PostgreSQL if tables are empty" as Seeder
+
+    component "Event Generator\nservices/event_generator/app.py\nPurpose: simulate user traffic, choose items\nusing per-user genre preferences and release-year bias,\nthen emit behavioral events to Kafka/Redpanda" as EventGen
+
+    component "Stream Processor\nservices/stream_processor/app.py\nPurpose: consume events, persist immutable\ninteraction history, store raw event objects, and\nupdate low-latency online/session features in Redis" as StreamProc
+
+    component "Trainer\nservices/trainer/app.py\nPurpose: periodic batch feature/model materialization\nfrom interactions + catalog into candidate tables\n(collaborative neighbors, content neighbors, trending, model version)" as Trainer
+
+    component "Recommendation API\nservices/recommendation_api/app.py\nPurpose: online retrieval + ranking endpoint\nGET /recommendations/{user_id}\nmerges offline candidates with online session state\nand applies filtering, scoring, and diversity" as API
+  }
+
+  queue "Redpanda\nKafka-compatible event bus\nTopic: user-events" as Kafka
+  database "PostgreSQL\nOperational + serving store" as Postgres
+  collections "Redis\nOnline/session feature store" as Redis
+  cloud "MinIO / S3\nRaw event lake" as MinIO
+  component "Prometheus\nMetrics scraper + TSDB" as Prometheus
+  component "Grafana\nDashboards / visualization" as Grafana
+  component "Jaeger\nTrace backend (OTLP endpoint)" as Jaeger
+  component "create-bucket init container\nPurpose: ensure raw-events bucket exists" as BucketInit
+}
+
+package "PostgreSQL logical schema" {
+  database "users\nUser profile serving attributes\n- user_id\n- region\n- preferred_language\n- maturity_rating" as TblUsers
+  database "items\nCatalog metadata for retrieval + filtering\n- title, type, genres, actors, director\n- synopsis, language, release_year\n- maturity_rating, available_regions, is_active" as TblItems
+  database "interactions\nEvent-level fact table / source of truth\n- event_id PK for dedupe\n- user_id, item_id, event_type\n- watch_seconds, completion_pct\n- region, device_type, event_ts, ingestion_ts" as TblInteractions
+  database "item_neighbors\nOffline candidate edges\n- source_item_id -> neighbor_item_id\n- score\n- algorithm: collaborative | content" as TblNeighbors
+  database "trending_items\nRegional fallback candidates\n- region, item_id, score" as TblTrending
+  database "model_versions\nTraining lineage marker\n- version\n- description\n- created_at" as TblModelVersion
+}
+
+package "Redis logical keys" {
+  collections "recent:{user_id}\nSorted set\nPurpose: most recent consumed items\nused for session context" as RedisRecent
+  collections "watched:{user_id}\nSet\nPurpose: watched-item suppression / dedupe" as RedisWatched
+  collections "genre_affinity:{user_id}\nHash\nPurpose: online genre preference accumulation" as RedisGenre
+  collections "popular:{region}\nSorted set\nPurpose: streaming regional popularity" as RedisPopular
+}
+
+package "Trainer internals" {
+  component "Collaborative builder\nCo-visitation from interaction history\n- keep engagement-like events\n- compute item-item co-occurrence\n- normalize by sqrt(item popularity)" as TrainCollab
+  component "Content builder\nTF-IDF over title + genres + actors\n+ director + synopsis\nthen cosine similarity top-K" as TrainContent
+  component "Trending builder\n24h regional aggregation using\ninteraction_weight(event_type, completion_pct)" as TrainTrending
+}
+
+package "Recommendation API internals" {
+  component "Candidate fetcher\nLoads neighbors for recent items\n(collaborative + content) and\nregional trending rows" as ApiFetch
+  component "Session scorer\nRecency-weighted boost over last 5 items\nwith decay factor 0.7" as ApiSession
+  component "Ranker\nWeighted blend:\n0.35 collaborative\n0.25 content\n0.20 session\n0.10 trending\n0.05 freshness\n0.05 genre bonus" as ApiRank
+  component "Guardrails\nExclude watched items\nExclude region-unavailable items\nExclude maturity mismatches\nCap top-N leading genre repetition" as ApiGuardrails
+}
+
+package "Observability" {
+  component "Structured JSON logs\nstdout logs enriched with service name" as ObsLogs
+  component "Prometheus metrics endpoints\nAPI: /metrics\nGenerator/Processor/Trainer: start_http_server" as ObsMetrics
+  component "OpenTelemetry spans\nFastAPI + requests instrumentation\nexported over OTLP/gRPC" as ObsTraces
+}
+
+SimUser --> EventGen : simulate viewing behavior
+EventGen --> Kafka : produce user-events\nkey=user_id, value=JSON event
+Client --> API : GET /recommendations/{user_id}
+
+Seeder --> Postgres : create tables + seed catalog/users
+BucketInit --> MinIO : create raw-events bucket
+
+StreamProc --> Kafka : consume topic user-events
+StreamProc --> MinIO : write partitioned raw event JSON\nyear/month/day/hour/user_id/event_id.json
+StreamProc --> Postgres : insert Interaction\n(dedupe on event_id)
+StreamProc --> Redis : update recent/watched/genre/popularity
+
+Trainer --> Postgres : read Item + Interaction tables
+Trainer --> TrainCollab : build collaborative neighbors
+Trainer --> TrainContent : build TF-IDF neighbors
+Trainer --> TrainTrending : build regional trending
+TrainCollab --> TblNeighbors : collaborative rows
+TrainContent --> TblNeighbors : content rows
+TrainTrending --> TblTrending : trending rows
+Trainer --> TblModelVersion : insert new model version
+Trainer --> TblNeighbors : full refresh (delete + insert)
+Trainer --> TblTrending : full refresh (delete + insert)
+
+API --> Redis : read recent, watched, genre_affinity
+API --> Postgres : read User, Item, ItemNeighbor, TrendingItem, ModelVersion
+API --> ApiFetch
+API --> ApiSession
+API --> ApiRank
+ApiRank --> ApiGuardrails
+ApiGuardrails --> Client : ranked recommendations payload
+
+Postgres --> TblUsers
+Postgres --> TblItems
+Postgres --> TblInteractions
+Postgres --> TblNeighbors
+Postgres --> TblTrending
+Postgres --> TblModelVersion
+
+Redis --> RedisRecent
+Redis --> RedisWatched
+Redis --> RedisGenre
+Redis --> RedisPopular
+
+EventGen ..> CommonConfig
+EventGen ..> CommonDB
+EventGen ..> CommonModels
+EventGen ..> CommonLogging
+EventGen ..> CommonMetrics
+EventGen ..> CommonTelemetry
+
+StreamProc ..> CommonConfig
+StreamProc ..> CommonDB
+StreamProc ..> CommonModels
+StreamProc ..> CommonRedis
+StreamProc ..> CommonLogging
+StreamProc ..> CommonMetrics
+StreamProc ..> CommonTelemetry
+
+Trainer ..> CommonConfig
+Trainer ..> CommonDB
+Trainer ..> CommonModels
+Trainer ..> CommonLogging
+Trainer ..> CommonMetrics
+Trainer ..> CommonTelemetry
+
+Seeder ..> CommonDB
+Seeder ..> CommonModels
+Seeder ..> CommonLogging
+
+API ..> CommonConfig
+API ..> CommonDB
+API ..> CommonModels
+API ..> CommonRedis
+API ..> CommonLogging
+API ..> CommonMetrics
+API ..> CommonTelemetry
+
+EventGen --> ObsLogs
+EventGen --> ObsMetrics
+EventGen --> ObsTraces
+StreamProc --> ObsLogs
+StreamProc --> ObsMetrics
+StreamProc --> ObsTraces
+Trainer --> ObsLogs
+Trainer --> ObsMetrics
+Trainer --> ObsTraces
+API --> ObsLogs
+API --> ObsMetrics
+API --> ObsTraces
+
+Prometheus --> API : scrape /metrics
+Prometheus --> EventGen : scrape port 9001
+Prometheus --> StreamProc : scrape port 9002
+Prometheus --> Trainer : scrape port 9003
+Grafana --> Prometheus : dashboards / charts
+Grafana --> Jaeger : trace exploration
+ObsTraces --> Jaeger : OTLP export
+
+note right of EventGen
+Behavior synthesis details:
+- active users per batch: random 4..8
+- each active user generates 1..3 events
+- event types are weighted
+- item selection uses static user genre priors
+  plus recency bias via release year
+- emits every ~2 seconds
+end note
+
+note right of StreamProc
+Online feature semantics:
+- recent:{user} is a ZSET by event timestamp
+- watched:{user} is a SET for suppression
+- genre_affinity:{user} is a HASH with weighted increments
+- popular:{region} is a ZSET updated per event
+This service links the streaming layer to online serving.
+end note
+
+note right of Trainer
+Training cadence:
+- infinite loop with 60 second sleep
+- no scheduler/orchestrator abstraction yet
+- full-table recomputation each cycle
+This is simple but clear for a demo system.
+end note
+
+note right of API
+Serving path:
+1. resolve user profile
+2. read online session state from Redis
+3. fetch offline candidate sources from Postgres
+4. create session candidates from recent items
+5. blend signals into final score
+6. apply availability/maturity/diversity guardrails
+7. return explanations per item
+end note
+
+note bottom of Postgres
+PostgreSQL has a dual role:
+- system-of-record for catalog, users, interactions
+- serving index for precomputed candidates and model metadata
+end note
+
+note bottom of Redis
+Redis holds mutable low-latency state used at request time.
+These features are not the source of truth; they are derived
+from the event stream for fast online personalization.
+end note
+
+note bottom of MinIO
+MinIO stores immutable raw event objects for replay,
+inspection, and lake-style retention independent
+of Postgres serving tables.
+end note
+
+@enduml
