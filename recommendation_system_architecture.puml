@@ -1,0 +1,82 @@
+@startuml
+left to right direction
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam linetype polyline
+skinparam nodesep 90
+skinparam ranksep 90
+skinparam defaultTextAlignment center
+skinparam ArrowThickness 1
+skinparam packageTitleFontStyle bold
+skinparam rectangle {
+  RoundCorner 8
+}
+skinparam note {
+  BackgroundColor #FFFDE7
+  BorderColor #BDB76B
+}
+
+title Simple Recommendation System Architecture
+
+actor "User / Client" as User
+
+package "Application Layer" as App {
+  rectangle "Seeder / Event Generator\nLoads demo data and test events" as Tools
+  rectangle "Stream Processor\nConsumes interaction events" as Stream
+  rectangle "Trainer\nBuilds similarity + popularity data" as Trainer
+  rectangle "Recommendation API\nServes recommendations" as API
+}
+
+package "Shared Code" as Shared {
+  rectangle "common/*\nConfig, DB models, logging, metrics,\nRedis, tracing, utilities" as Common
+}
+
+package "Data & Infrastructure" as Infra {
+  queue "Kafka / Redpanda\nInteraction event stream" as Kafka
+  database "PostgreSQL\nUsers, items, interactions" as Postgres
+  collections "Redis\nFast candidate lookup / caches" as Redis
+  rectangle "Prometheus / Metrics\nMonitoring" as Metrics
+  cloud "MinIO / S3\nModel artifacts" as Minio
+}
+
+' Main request flow
+User --> API : request recommendations
+API --> Redis : fetch precomputed candidates
+API --> Postgres : enrich item details
+API --> Minio : load model metadata
+API --> Metrics : expose API metrics
+
+' Ingestion flow
+Tools --> Postgres : seed catalog + interactions
+Tools --> Kafka : publish sample events
+Kafka --> Stream : consume events
+Stream --> Postgres : persist interactions
+Stream --> Redis : update online features / counters
+Stream --> Metrics : processing metrics
+
+' Training flow
+Postgres --> Trainer : training data
+Trainer --> Minio : write trained artifacts
+Trainer --> Redis : publish fresh candidates / scores
+Trainer --> Metrics : training metrics
+
+' Shared library usage
+API ..> Common
+Stream ..> Common
+Trainer ..> Common
+Tools ..> Common
+
+note top of API
+Online serving layer
+end note
+
+note top of Stream
+Real-time ingestion layer
+end note
+
+note top of Trainer
+Offline batch layer
+end note
+
+@enduml
