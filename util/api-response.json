@@ -1,0 +1,56 @@
+{
+  "user_id": "u001",
+  "context": "home",
+  "model_version": "hybrid-20260325083926",
+  "recent_items": [
+    "m006",
+    "m003",
+    "m007",
+    "m010",
+    "m011",
+    "m012",
+    "m002",
+    "m008",
+    "m001",
+    "m005"
+  ],
+  "recommendations": [
+    {
+      "item_id": "m002",
+      "title": "Neon District",
+      "genres": [
+        "sci-fi",
+        "action"
+      ],
+      "score": 0.2643,
+      "reason": "genre_bonus",
+      "components": {
+        "collaborative": 0.0,
+        "content": 0.4341,
+        "session": 0.343,
+        "trending": 0.0,
+        "freshness": 0.8333,
+        "genre_bonus": 0.91
+      }
+    },
+    {
+      "item_id": "m009",
+      "title": "The Last Pitch",
+      "genres": [
+        "sports",
+        "drama"
+      ],
+      "score": 0.1771,
+      "reason": "freshness",
+      "components": {
+        "collaborative": 0.0,
+        "content": 0.4039,
+        "session": 0.0,
+        "trending": 0.0,
+        "freshness": 0.8333,
+        "genre_bonus": 0.69
+      }
+    }
+  ],
+  "latency_ms": 13.87
+}
