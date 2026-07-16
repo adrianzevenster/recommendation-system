@@ -87,3 +87,45 @@ class ModelVersion(Base):
     version: Mapped[str] = mapped_column(String(64), primary_key=True)
     description: Mapped[str] = mapped_column(String(256), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class RankingWeights(Base):
+    """Learned signal weights produced by the trainer after each run."""
+    __tablename__ = "ranking_weights"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_version: Mapped[str] = mapped_column(String(64), index=True)
+    collaborative: Mapped[float] = mapped_column(Float, default=0.35)
+    content: Mapped[float] = mapped_column(Float, default=0.25)
+    session: Mapped[float] = mapped_column(Float, default=0.20)
+    trending: Mapped[float] = mapped_column(Float, default=0.10)
+    freshness: Mapped[float] = mapped_column(Float, default=0.05)
+    genre_bonus: Mapped[float] = mapped_column(Float, default=0.05)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ModelEvaluation(Base):
+    """Offline evaluation metrics computed after each training run."""
+    __tablename__ = "model_evaluations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_version: Mapped[str] = mapped_column(String(64), index=True)
+    ndcg_at_10: Mapped[float] = mapped_column(Float, default=0.0)
+    hit_rate_at_10: Mapped[float] = mapped_column(Float, default=0.0)
+    coverage: Mapped[float] = mapped_column(Float, default=0.0)
+    test_user_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Experiment(Base):
+    """A/B experiment definition. Only one experiment should be active at a time."""
+    __tablename__ = "experiments"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    description: Mapped[str] = mapped_column(String(256), default="")
+    traffic_pct: Mapped[int] = mapped_column(Integer, default=10)
+    # JSON dict: {"collaborative": 0.45, "content": 0.20, ...}
+    variant_weights: Mapped[str] = mapped_column(Text, default="{}")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

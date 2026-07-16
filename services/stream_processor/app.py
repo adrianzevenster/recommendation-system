@@ -101,6 +101,11 @@ def persist_interaction(session, event: dict) -> bool:
     return True
 
 
+_GENRE_AFFINITY_TTL = 7 * 24 * 3600   # 7 days — stale affinity hurts more than missing
+_POPULARITY_TTL = 24 * 3600            # 24 hours — regional trends are short-lived
+_MAX_POPULARITY_SET = 500              # cap the sorted set to avoid unbounded growth
+
+
 def update_online_features(session, event: dict) -> None:
     item = session.get(Item, event["item_id"])
     if item is None:
@@ -134,8 +139,12 @@ def update_online_features(session, event: dict) -> None:
 
     for genre in item.genres.split(","):
         redis_client.hincrbyfloat(genre_key, genre.strip(), increment)
+    redis_client.expire(genre_key, _GENRE_AFFINITY_TTL)
 
     redis_client.zincrby(popularity_key, increment, event["item_id"])
+    # Keep only the top-N items to bound memory; trim the lowest-scored tail
+    redis_client.zremrangebyrank(popularity_key, 0, -(_MAX_POPULARITY_SET + 1))
+    redis_client.expire(popularity_key, _POPULARITY_TTL)
 
 
 def serve_metrics():

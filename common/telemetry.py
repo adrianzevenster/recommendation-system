@@ -1,7 +1,5 @@
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -21,12 +19,15 @@ def setup_tracing(service_name: str):
     exporter = OTLPSpanExporter(endpoint=settings.otel_exporter_otlp_endpoint, insecure=True)
     provider.add_span_processor(BatchSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
+    # Lazy import: opentelemetry-instrumentation-* uses pkg_resources at import time.
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
     RequestsInstrumentor().instrument()
     _INITIALIZED = True
     return trace.get_tracer(service_name)
 
 
 def instrument_fastapi(app, service_name: str):
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     tracer = setup_tracing(service_name)
     FastAPIInstrumentor.instrument_app(app)
     return tracer

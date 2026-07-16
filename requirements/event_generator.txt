@@ -1,0 +1,2 @@
+-r base.txt
+confluent-kafka==2.5.3
