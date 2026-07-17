@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stream-processor
+  namespace: recsys
+  labels:
+    app: stream-processor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stream-processor
+  template:
+    metadata:
+      labels:
+        app: stream-processor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9002"
+    spec:
+      containers:
+        - name: stream-processor
+          image: ghcr.io/YOUR_ORG/recsys-stream-processor:latest
+          envFrom:
+            - configMapRef:
+                name: recsys-config
+            - secretRef:
+                name: recsys-secrets
+          env:
+            - name: SERVICE_NAME
+              value: stream-processor
+            - name: METRICS_PORT
+              value: "9002"
+          ports:
+            - containerPort: 9002
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 200m
+            limits:
+              memory: 512Mi
+              cpu: 500m

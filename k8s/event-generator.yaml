@@ -1,0 +1,43 @@
+# Event generator is a load simulator — only deploy in non-production environments.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-generator
+  namespace: recsys
+  labels:
+    app: event-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: event-generator
+  template:
+    metadata:
+      labels:
+        app: event-generator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9001"
+    spec:
+      containers:
+        - name: event-generator
+          image: ghcr.io/YOUR_ORG/recsys-event-generator:latest
+          envFrom:
+            - configMapRef:
+                name: recsys-config
+            - secretRef:
+                name: recsys-secrets
+          env:
+            - name: SERVICE_NAME
+              value: event-generator
+            - name: METRICS_PORT
+              value: "9001"
+          ports:
+            - containerPort: 9001
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 300m

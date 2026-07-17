@@ -1,0 +1,76 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trainer
+  namespace: recsys
+spec:
+  # Run every 60 minutes — adjust based on interaction volume
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: trainer
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "9003"
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: trainer
+              image: ghcr.io/YOUR_ORG/recsys-trainer:latest
+              envFrom:
+                - configMapRef:
+                    name: recsys-config
+                - secretRef:
+                    name: recsys-secrets
+              env:
+                - name: SERVICE_NAME
+                  value: trainer
+                - name: METRICS_PORT
+                  value: "9003"
+              ports:
+                - containerPort: 9003
+              resources:
+                requests:
+                  memory: 512Mi
+                  cpu: 500m
+                limits:
+                  memory: 2Gi
+                  cpu: 2000m
+---
+# Separate CronJob for data retention — runs daily at 02:00 UTC
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: prune-interactions
+  namespace: recsys
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: prune
+              image: ghcr.io/YOUR_ORG/recsys-trainer:latest
+              command: ["python", "scripts/prune_interactions.py", "--days", "90"]
+              envFrom:
+                - configMapRef:
+                    name: recsys-config
+                - secretRef:
+                    name: recsys-secrets
+              resources:
+                requests:
+                  memory: 128Mi
+                  cpu: 100m
+                limits:
+                  memory: 256Mi

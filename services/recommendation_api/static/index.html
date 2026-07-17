@@ -359,16 +359,7 @@
     <div class="field">
       <label>User</label>
       <select id="user-select">
-        <option value="u001">u001 · UK · PG-13 · thriller</option>
-        <option value="u002">u002 · ZA · PG-13 · action</option>
-        <option value="u003">u003 · US · PG · comedy</option>
-        <option value="u004">u004 · UK · PG · romance</option>
-        <option value="u005">u005 · ZA · PG · history</option>
-        <option value="u006">u006 · US · PG-13 · sci-fi</option>
-        <option value="u007">u007 · ZA · PG-13 · crime</option>
-        <option value="u008">u008 · UK · PG-13 · comedy</option>
-        <option value="u009">u009 · US · PG · sports</option>
-        <option value="u010">u010 · ZA · PG · history</option>
+        <option value="">Loading users…</option>
       </select>
     </div>
 
@@ -478,6 +469,19 @@
   const content       = $('content');
   const modelBadge    = $('model-version');
   const latencyEl     = $('latency-display');
+
+  async function loadUsers() {
+    try {
+      const res = await fetch('/users?limit=50');
+      if (!res.ok) return;
+      const data = await res.json();
+      userSelect.innerHTML = data.users
+        .map(u => `<option value="${u.user_id}">${u.user_id} · ${u.region} · ${u.maturity_rating}</option>`)
+        .join('');
+      if (data.users.length) fetchRecs();
+    } catch (_) {}
+  }
+  loadUsers();
 
   limitRange.addEventListener('input', () => limitVal.textContent = limitRange.value);
   fetchBtn.addEventListener('click', fetchRecs);

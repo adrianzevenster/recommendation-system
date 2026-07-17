@@ -1,0 +1,102 @@
+groups:
+  - name: recsys.ml
+    rules:
+      - alert: NdcgDrop
+        expr: recsys_eval_ndcg_at_10 > 0 and recsys_eval_ndcg_at_10 < 0.10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NDCG@10 dropped below 0.10"
+          description: >
+            NDCG@10 is {{ printf "%.3f" $value }}, which is below the minimum
+            acceptable threshold of 0.10.  Check the latest training run for
+            data quality issues or a broken weight-learning step.
+
+      - alert: HitRateDrop
+        expr: recsys_eval_hit_rate_at_10 > 0 and recsys_eval_hit_rate_at_10 < 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hit rate@10 dropped below 5%"
+          description: >
+            Hit rate@10 is {{ printf "%.3f" $value }}.  The model is failing
+            to surface relevant items for most users.
+
+      - alert: CatalogCoverageLow
+        expr: recsys_eval_catalog_coverage < 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Catalog coverage below 5%"
+          description: >
+            Only {{ printf "%.1f" (mul $value 100) }}% of the catalog appears
+            in any user's top-10.  The recommender may be stuck in a popularity
+            trap — check collaborative neighbor diversity.
+
+  - name: recsys.serving
+    rules:
+      - alert: ColdStartSpike
+        expr: >
+          rate(recsys_cold_start_requests_total[5m])
+          / rate(recsys_recommendation_requests_total[5m]) > 0.40
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 40% of requests are cold-start"
+          description: >
+            Cold-start fraction is {{ printf "%.0f" (mul $value 100) }}%.
+            Either the Redis recent-set is being evicted too aggressively or
+            a large wave of new users arrived without any stream-processor
+            history.
+
+      - alert: HighP99Latency
+        expr: >
+          histogram_quantile(0.99,
+            sum(rate(recsys_request_latency_seconds_bucket[5m])) by (le)
+          ) > 0.5
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "P99 recommendation latency > 500 ms"
+          description: >
+            P99 latency is {{ printf "%.0f" (mul $value 1000) }} ms.
+            Check Postgres query plans, Redis connectivity, and API pod
+            resource limits.
+
+      - alert: RecommendationApiDown
+        expr: up{job="recommendation-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Recommendation API is unreachable"
+          description: "Prometheus cannot scrape the recommendation-api metrics endpoint."
+
+  - name: recsys.pipeline
+    rules:
+      - alert: TrainingStalled
+        expr: increase(recsys_models_trained_total[2h]) == 0
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No training run completed in the last 2 hours"
+          description: >
+            The trainer has not completed a run in over 2 hours.
+            Check trainer pod logs and Postgres connectivity.
+
+      - alert: EventConsumptionDropped
+        expr: rate(recsys_events_consumed_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream processor is not consuming events"
+          description: >
+            No events have been consumed for 10 minutes.  Check the
+            stream-processor pod and Kafka/Redpanda connectivity.

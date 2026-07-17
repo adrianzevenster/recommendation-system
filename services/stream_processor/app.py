@@ -101,11 +101,6 @@ def persist_interaction(session, event: dict) -> bool:
     return True
 
 
-_GENRE_AFFINITY_TTL = 7 * 24 * 3600   # 7 days — stale affinity hurts more than missing
-_POPULARITY_TTL = 24 * 3600            # 24 hours — regional trends are short-lived
-_MAX_POPULARITY_SET = 500              # cap the sorted set to avoid unbounded growth
-
-
 def update_online_features(session, event: dict) -> None:
     item = session.get(Item, event["item_id"])
     if item is None:
@@ -139,16 +134,19 @@ def update_online_features(session, event: dict) -> None:
 
     for genre in item.genres.split(","):
         redis_client.hincrbyfloat(genre_key, genre.strip(), increment)
-    redis_client.expire(genre_key, _GENRE_AFFINITY_TTL)
+    redis_client.expire(genre_key, 86400 * 30)  # 30-day rolling window
 
     redis_client.zincrby(popularity_key, increment, event["item_id"])
-    # Keep only the top-N items to bound memory; trim the lowest-scored tail
-    redis_client.zremrangebyrank(popularity_key, 0, -(_MAX_POPULARITY_SET + 1))
-    redis_client.expire(popularity_key, _POPULARITY_TTL)
+    redis_client.expire(popularity_key, 86400 * 7)  # 7-day rolling window
 
 
 def serve_metrics():
     start_http_server(settings.metrics_port)
+
+
+def make_producer():
+    from confluent_kafka import Producer
+    return Producer({"bootstrap.servers": settings.kafka_bootstrap_servers})
 
 
 def main() -> None:
@@ -159,6 +157,7 @@ def main() -> None:
     consumer.subscribe([settings.kafka_topic_events])
     s3 = make_s3_client()
     ensure_bucket(s3)
+    dlq_producer = make_producer()
 
     try:
         while True:
@@ -170,15 +169,23 @@ def main() -> None:
                 continue
 
             with tracer.start_as_current_span("process_event"):
-                event = json.loads(msg.value().decode("utf-8"))
-                save_raw_event(s3, event)
-                with SessionLocal() as session:
-                    inserted = persist_interaction(session, event)
-                    update_online_features(session, event)
-                    session.commit()
-                if inserted:
-                    EVENTS_CONSUMED.labels(event_type=event["event_type"]).inc()
-                    logger.info("Processed event", extra=event)
+                try:
+                    event = json.loads(msg.value().decode("utf-8"))
+                    save_raw_event(s3, event)
+                    with SessionLocal() as session:
+                        inserted = persist_interaction(session, event)
+                        session.commit()
+                        update_online_features(session, event)
+                    if inserted:
+                        EVENTS_CONSUMED.labels(event_type=event["event_type"]).inc()
+                        logger.info("Processed event", extra=event)
+                except Exception as exc:
+                    logger.error(
+                        "Event processing failed — routing to dead-letter",
+                        extra={"error": str(exc), "raw": msg.value().decode("utf-8", errors="replace")},
+                    )
+                    dlq_producer.produce(settings.kafka_topic_dead_letter, value=msg.value())
+                    dlq_producer.poll(0)
     finally:
         consumer.close()
 

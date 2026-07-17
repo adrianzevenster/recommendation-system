@@ -60,7 +60,7 @@ class Interaction(Base):
 
 class ItemNeighbor(Base):
     __tablename__ = "item_neighbors"
-    __table_args__ = (UniqueConstraint("source_item_id", "neighbor_item_id", name="uq_item_neighbor"),)
+    __table_args__ = (UniqueConstraint("source_item_id", "neighbor_item_id", "algorithm", name="uq_item_neighbor"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_item_id: Mapped[str] = mapped_column(String(64), index=True)

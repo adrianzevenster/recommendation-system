@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recsys-config
+  namespace: recsys
+data:
+  POSTGRES_HOST: postgres
+  POSTGRES_DB: recsys
+  POSTGRES_USER: recsys
+  REDIS_HOST: redis
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+  KAFKA_GROUP_ID: stream-processor
+  KAFKA_TOPIC_EVENTS: user-events
+  KAFKA_TOPIC_DEAD_LETTER: dead-letter
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_BUCKET: raw-events
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+  RECOMMENDATION_LIMIT_DEFAULT: "10"
+  API_KEY: ""

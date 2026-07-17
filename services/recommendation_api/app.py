@@ -8,8 +8,11 @@ from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Security
 from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.security import APIKeyHeader
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
@@ -121,6 +124,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Recommendation API", lifespan=lifespan)
 instrument_fastapi(app, SERVICE_NAME)
 
+# ---------------------------------------------------------------------------
+# Optional API key auth — disabled when settings.api_key is empty
+# ---------------------------------------------------------------------------
+
+_API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def _verify_api_key(key: str = Security(_API_KEY_HEADER)) -> None:
+    if settings.api_key and key != settings.api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
 
 # ---------------------------------------------------------------------------
 # Pure helper functions
@@ -180,6 +194,53 @@ def fetch_session_candidates(recent_items: list[str]) -> dict[str, float]:
     return normalize_scores(session_scores)
 
 
+def _genre_jaccard(genres_a: str, genres_b: str) -> float:
+    """Jaccard similarity between two comma-separated genre strings."""
+    a = {g.strip() for g in genres_a.split(",")}
+    b = {g.strip() for g in genres_b.split(",")}
+    union = len(a | b)
+    return len(a & b) / union if union else 0.0
+
+
+def _mmr_rerank(
+    scored: list[tuple],
+    limit: int,
+    lambda_mmr: float = 0.7,
+) -> list[tuple]:
+    """
+    Maximal Marginal Relevance re-ranking.
+
+    Balances relevance (the pre-computed score) against diversity (genre
+    dissimilarity to already-selected items).  lambda_mmr=1.0 is pure
+    relevance; lambda_mmr=0.0 is pure diversity.
+    """
+    if not scored:
+        return []
+
+    selected: list[tuple] = []
+    remaining = list(scored)
+
+    while remaining and len(selected) < limit:
+        if not selected:
+            selected.append(remaining.pop(0))
+            continue
+
+        best_mmr = -float("inf")
+        best_idx = 0
+        for idx, (item, score, reason, components) in enumerate(remaining):
+            max_sim = max(
+                _genre_jaccard(item.genres, s[0].genres) for s in selected
+            )
+            mmr_score = lambda_mmr * score - (1.0 - lambda_mmr) * max_sim
+            if mmr_score > best_mmr:
+                best_mmr = mmr_score
+                best_idx = idx
+
+        selected.append(remaining.pop(best_idx))
+
+    return selected
+
+
 def rank_candidates(
     session,
     user: User,
@@ -196,7 +257,13 @@ def rank_candidates(
         for k, v in redis_client.hgetall(f"genre_affinity:{user.user_id}").items()
     }
 
-    candidate_ids = set(collab) | set(content) | set(session_scores) | set(trending)
+    # Personalized trending: blend DB trending with real-time Redis popularity
+    # weighted by the user's genre affinity so popular items in preferred genres
+    # score higher than cold regional trending items.
+    pop_raw = dict(redis_client.zrange(f"popular:{user.region}", 0, -1, withscores=True))
+    pop_max = max(pop_raw.values(), default=1.0) or 1.0
+
+    candidate_ids = set(collab) | set(content) | set(session_scores) | set(trending) | set(pop_raw)
     CANDIDATES_GENERATED.labels(source="merged").observe(len(candidate_ids))
 
     items = (
@@ -223,12 +290,17 @@ def rank_candidates(
         )
         freshness = min(max((item.release_year - 2020) / 6.0, 0.0), 1.0)
 
+        # Blend DB trending (batch-updated by trainer) with real-time Redis
+        # popularity personalised by genre affinity.
+        rt_pop = (pop_raw.get(item_id, 0.0) / pop_max) * (1.0 + 0.5 * genre_bonus)
+        blended_trending = 0.6 * trending.get(item_id, 0.0) + 0.4 * min(rt_pop, 1.0)
+
         w = weights
         score = (
             w[0] * collab.get(item_id, 0.0)
             + w[1] * content.get(item_id, 0.0)
             + w[2] * session_scores.get(item_id, 0.0)
-            + w[3] * trending.get(item_id, 0.0)
+            + w[3] * blended_trending
             + w[4] * freshness
             + w[5] * genre_bonus
         )
@@ -236,7 +308,7 @@ def rank_candidates(
             "collaborative": collab.get(item_id, 0.0),
             "content": content.get(item_id, 0.0),
             "session": session_scores.get(item_id, 0.0),
-            "trending": trending.get(item_id, 0.0),
+            "trending": round(blended_trending, 4),
             "freshness": freshness,
             "genre_bonus": genre_bonus,
         }
@@ -245,25 +317,21 @@ def rank_candidates(
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # Diversity guardrail: no more than two of the same leading genre in top-N.
-    results = []
-    genre_counts: dict[str, int] = defaultdict(int)
-    for item, score, reason, components in scored:
-        lead_genre = item.genres.split(",")[0].strip()
-        if genre_counts[lead_genre] >= 2:
-            continue
-        genre_counts[lead_genre] += 1
-        results.append({
+    # MMR re-ranking: pick top 3× candidates then apply diversity re-ranking
+    # so the final list balances relevance with genre variety.
+    reranked = _mmr_rerank(scored[: limit * 3], limit=limit, lambda_mmr=0.7)
+
+    return [
+        {
             "item_id": item.item_id,
             "title": item.title,
             "genres": item.genres.split(","),
             "score": round(score, 4),
             "reason": reason,
             "components": {k: round(v, 4) for k, v in components.items()},
-        })
-        if len(results) >= limit:
-            break
-    return results
+        }
+        for item, score, reason, components in reranked
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +399,15 @@ def _build_cold_start_response(session, user: User, limit: int) -> list[dict[str
 
 
 # ---------------------------------------------------------------------------
-# Pydantic schemas for the experiment management endpoints
+# Pydantic schemas
 # ---------------------------------------------------------------------------
+
+class FeedbackEvent(BaseModel):
+    user_id: str
+    item_id: str
+    event_type: str
+    watch_seconds: int = 0
+    completion_pct: float = 0.0
 
 class ExperimentCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
@@ -375,11 +450,12 @@ def metrics():
     return PlainTextResponse(generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/recommendations/{user_id}")
+@app.get("/recommendations/{user_id}", dependencies=[Depends(_verify_api_key)])
 def recommendations(
     user_id: str,
     context: str = Query(default="home"),
     limit: int = Query(default=settings.recommendation_limit_default, ge=1, le=25),
+    offset: int = Query(default=0, ge=0),
 ):
     started = time.perf_counter()
     RECOMMENDATION_REQUESTS.labels(context=context).inc()
@@ -408,13 +484,13 @@ def recommendations(
         is_cold_start = len(recent_items) < _COLD_START_THRESHOLD
         if is_cold_start:
             COLD_START_REQUESTS.inc()
-            recs = _build_cold_start_response(session, user, limit)
+            recs = _build_cold_start_response(session, user, limit + offset)[offset:]
         else:
             collab, content, trending = fetch_candidate_scores(session, recent_items, user.region)
             session_scores = fetch_session_candidates(recent_items)
             recs = rank_candidates(
-                session, user, collab, content, session_scores, trending, watched, limit, weights
-            )
+                session, user, collab, content, session_scores, trending, watched, limit + offset, weights
+            )[offset:]
 
         model_version = get_latest_model_version(session)
 
@@ -424,6 +500,7 @@ def recommendations(
     return {
         "user_id": user_id,
         "context": context,
+        "offset": offset,
         "model_version": model_version,
         "is_cold_start": is_cold_start,
         "experiment": experiment_info,
@@ -438,7 +515,7 @@ def recommendations(
 # Experiment management endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/experiments", status_code=201)
+@app.post("/experiments", status_code=201, dependencies=[Depends(_verify_api_key)])
 def create_experiment(body: ExperimentCreate):
     try:
         validated = body.validated_weights()
@@ -492,7 +569,7 @@ def list_experiments():
         ]
 
 
-@app.delete("/experiments/{name}", status_code=200)
+@app.delete("/experiments/{name}", status_code=200, dependencies=[Depends(_verify_api_key)])
 def deactivate_experiment(name: str):
     with SessionLocal() as session:
         experiment = session.get(Experiment, name)
@@ -505,3 +582,66 @@ def deactivate_experiment(name: str):
             _exp_cache["ts"] = 0.0
 
     return {"name": name, "is_active": False}
+
+
+# ---------------------------------------------------------------------------
+# Feedback endpoint — write explicit user signals to the interactions table
+# ---------------------------------------------------------------------------
+
+@app.post("/feedback", status_code=201, dependencies=[Depends(_verify_api_key)])
+def submit_feedback(body: FeedbackEvent):
+    from datetime import datetime
+    with SessionLocal() as session:
+        if not session.get(User, body.user_id):
+            raise HTTPException(status_code=404, detail=f"Unknown user '{body.user_id}'")
+        user = session.get(User, body.user_id)
+        if not session.get(Item, body.item_id):
+            raise HTTPException(status_code=404, detail=f"Unknown item '{body.item_id}'")
+
+        event_id = f"fb_{uuid4()}"
+        now = datetime.utcnow()
+        session.add(Interaction(
+            event_id=event_id,
+            user_id=body.user_id,
+            item_id=body.item_id,
+            event_type=body.event_type,
+            watch_seconds=body.watch_seconds,
+            completion_pct=body.completion_pct,
+            region=user.region,
+            device_type="feedback",
+            event_ts=now,
+            ingestion_ts=now,
+        ))
+        session.commit()
+
+    return {"status": "ok", "event_id": event_id}
+
+
+# ---------------------------------------------------------------------------
+# Users listing endpoint — used by the UI to populate the user selector
+# ---------------------------------------------------------------------------
+
+@app.get("/users")
+def list_users(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    region: str | None = Query(default=None),
+):
+    from sqlalchemy import func
+    with SessionLocal() as session:
+        q = select(User)
+        count_q = select(func.count()).select_from(User)
+        if region:
+            q = q.where(User.region == region)
+            count_q = count_q.where(User.region == region)
+        total = session.execute(count_q).scalar_one()
+        users = session.execute(q.offset(offset).limit(limit)).scalars().all()
+        return {
+            "users": [
+                {"user_id": u.user_id, "region": u.region, "maturity_rating": u.maturity_rating}
+                for u in users
+            ],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+        }

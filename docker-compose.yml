@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: recsys
       POSTGRES_PASSWORD: recsys
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -78,6 +78,17 @@ services:
       - "4317:4317"
       - "4318:4318"
 
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - --config.file=/etc/alertmanager/config.yml
+    environment:
+      ALERTMANAGER_WEBHOOK_URL: "${ALERTMANAGER_WEBHOOK_URL:-}"
+    volumes:
+      - ./observability/alertmanager/config.yml:/etc/alertmanager/config.yml:ro
+    ports:
+      - "9094:9093"
+
   prometheus:
     image: prom/prometheus:v2.54.1
     command:
@@ -85,9 +96,11 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports:
       - "9090:9090"
     depends_on:
+      - alertmanager
       - recommendation-api
       - event-generator
       - stream-processor
