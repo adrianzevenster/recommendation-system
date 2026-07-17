@@ -1,0 +1,35 @@
+# Replace YOUR_ORG with your GitHub org, or use kustomize image overrides.
+# Run this Job once to bootstrap the database with the MovieLens 1M catalog.
+# Re-running is safe — the seeder is idempotent (skips if already seeded).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seeder
+  namespace: recsys
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app: seeder
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seeder
+          image: ghcr.io/YOUR_ORG/recsys-seeder:latest
+          command: ["python", "-m", "services.seeder.app"]
+          envFrom:
+            - configMapRef:
+                name: recsys-config
+            - secretRef:
+                name: recsys-secrets
+          env:
+            - name: SERVICE_NAME
+              value: seeder
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 200m
+            limits:
+              memory: 512Mi
+              cpu: 500m

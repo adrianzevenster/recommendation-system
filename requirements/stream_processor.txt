@@ -1,0 +1,4 @@
+-r base.txt
+confluent-kafka==2.5.3
+boto3==1.35.24
+redis==5.0.8

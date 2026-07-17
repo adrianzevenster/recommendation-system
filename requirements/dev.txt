@@ -1,0 +1,12 @@
+# All service deps + test tooling — used in CI and local development
+-r recommendation_api.txt
+confluent-kafka==2.5.3
+boto3==1.35.24
+pandas==2.2.3
+numpy==2.1.1
+scikit-learn==1.5.2
+pytest==8.3.4
+pytest-cov==6.0.0
+fakeredis==2.26.2
+# opentelemetry-instrumentation-* uses pkg_resources, removed in setuptools>=83
+setuptools<83

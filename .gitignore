@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+*.whl
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version-local
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.lcov
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+.pyright/
+.ruff_cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# Database files (local dev only — never commit state)
+*.db
+*.sqlite
+*.sqlite3
+
+# Distribution / packaging (wheel builds)
+*.tar.gz
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Terraform (if added later)
+*.tfstate
+*.tfstate.backup
+.terraform/

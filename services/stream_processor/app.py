@@ -134,12 +134,19 @@ def update_online_features(session, event: dict) -> None:
 
     for genre in item.genres.split(","):
         redis_client.hincrbyfloat(genre_key, genre.strip(), increment)
+    redis_client.expire(genre_key, 86400 * 30)  # 30-day rolling window
 
     redis_client.zincrby(popularity_key, increment, event["item_id"])
+    redis_client.expire(popularity_key, 86400 * 7)  # 7-day rolling window
 
 
 def serve_metrics():
     start_http_server(settings.metrics_port)
+
+
+def make_producer():
+    from confluent_kafka import Producer
+    return Producer({"bootstrap.servers": settings.kafka_bootstrap_servers})
 
 
 def main() -> None:
@@ -150,6 +157,7 @@ def main() -> None:
     consumer.subscribe([settings.kafka_topic_events])
     s3 = make_s3_client()
     ensure_bucket(s3)
+    dlq_producer = make_producer()
 
     try:
         while True:
@@ -161,15 +169,23 @@ def main() -> None:
                 continue
 
             with tracer.start_as_current_span("process_event"):
-                event = json.loads(msg.value().decode("utf-8"))
-                save_raw_event(s3, event)
-                with SessionLocal() as session:
-                    inserted = persist_interaction(session, event)
-                    update_online_features(session, event)
-                    session.commit()
-                if inserted:
-                    EVENTS_CONSUMED.labels(event_type=event["event_type"]).inc()
-                    logger.info("Processed event", extra=event)
+                try:
+                    event = json.loads(msg.value().decode("utf-8"))
+                    save_raw_event(s3, event)
+                    with SessionLocal() as session:
+                        inserted = persist_interaction(session, event)
+                        session.commit()
+                        update_online_features(session, event)
+                    if inserted:
+                        EVENTS_CONSUMED.labels(event_type=event["event_type"]).inc()
+                        logger.info("Processed event", extra=event)
+                except Exception as exc:
+                    logger.error(
+                        "Event processing failed — routing to dead-letter",
+                        extra={"error": str(exc), "raw": msg.value().decode("utf-8", errors="replace")},
+                    )
+                    dlq_producer.produce(settings.kafka_topic_dead_letter, value=msg.value())
+                    dlq_producer.poll(0)
     finally:
         consumer.close()
 

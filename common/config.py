@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     kafka_bootstrap_servers: str = "redpanda:9092"
     kafka_topic_events: str = "user-events"
+    kafka_topic_dead_letter: str = "dead-letter"
     kafka_group_id: str = "recsys-group"
 
     minio_endpoint: str = "http://minio:9000"
@@ -27,6 +28,7 @@ class Settings(BaseSettings):
     api_port: int = 8000
     metrics_port: int = 9000
     recommendation_limit_default: int = 10
+    api_key: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

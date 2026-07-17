@@ -1,0 +1,69 @@
+@startuml
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam linetype ortho
+
+title Simple Recommendation System Architecture
+
+actor "User / Client" as User
+
+package "Application Layer" {
+  [Recommendation API\nServes recommendations] as API
+  [Stream Processor\nConsumes interaction events] as Stream
+  [Trainer\nBuilds similarity + popularity data] as Trainer
+  [Seeder / Event Generator\nLoads demo data and test events] as Tools
+}
+
+package "Shared Code" {
+  [common/*\nConfig, DB models, logging, metrics,\nRedis, tracing, utilities] as Common
+}
+
+package "Data & Infrastructure" {
+  database "PostgreSQL\nUsers, items, interactions" as Postgres
+  queue "Kafka / Redpanda\nInteraction event stream" as Kafka
+  collections "Redis\nFast candidate lookup / caches" as Redis
+  cloud "MinIO / S3\nModel artifacts" as Minio
+  [Prometheus / Metrics\nMonitoring] as Metrics
+}
+
+User --> API : request recommendations
+API --> Redis : fetch precomputed candidates
+API --> Postgres : enrich item details
+API --> Minio : load model metadata (if needed)
+API --> Metrics : expose API metrics
+
+Tools --> Postgres : seed catalog + interactions
+Tools --> Kafka : publish sample events
+
+Kafka --> Stream : consume events
+Stream --> Postgres : persist interactions
+Stream --> Redis : update online features / counters
+Stream --> Metrics : processing metrics
+
+Postgres --> Trainer : training data
+Trainer --> Minio : write trained artifacts
+Trainer --> Redis : publish fresh candidates / scores
+Trainer --> Metrics : training metrics
+
+API ..> Common
+Stream ..> Common
+Trainer ..> Common
+Tools ..> Common
+
+note right of API
+Online serving layer.
+Returns ranked recommendations.
+end note
+
+note right of Stream
+Real-time ingestion layer.
+Turns user events into stored state.
+end note
+
+note right of Trainer
+Offline batch layer.
+Produces recommendation data for serving.
+end note
+
+@enduml

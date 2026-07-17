@@ -28,6 +28,14 @@ def serve_metrics():
     start_http_server(settings.metrics_port)
 
 
+def temporal_split(interactions: list, eval_fraction: float = 0.2) -> tuple[list, list]:
+    if not interactions:
+        return [], []
+    sorted_ixs = sorted(interactions, key=lambda ix: ix.event_ts)
+    split_idx = int(len(sorted_ixs) * (1 - eval_fraction))
+    return sorted_ixs[:split_idx], sorted_ixs[split_idx:]
+
+
 def wait_for_postgres() -> None:
     for _ in range(30):
         try:
@@ -170,12 +178,16 @@ def main() -> None:
     threading.Thread(target=serve_metrics, daemon=True).start()
     wait_for_postgres()
     Base.metadata.create_all(bind=engine)
+    backoff = 60
     while True:
         try:
             run_training_once()
+            backoff = 60
         except Exception as exc:
             logger.exception("Training failed", extra={"error": str(exc)})
-        time.sleep(60)
+            backoff = min(backoff * 2, 3600)
+            logger.info("Retrying after backoff", extra={"seconds": backoff})
+        time.sleep(backoff)
 
 
 if __name__ == "__main__":
