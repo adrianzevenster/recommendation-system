@@ -33,6 +33,8 @@ jobs:
             -r requirements/stream_processor.txt \
             -r requirements/trainer.txt \
             -r requirements/event_generator.txt \
+            -r requirements/seeder.txt \
+            -r requirements/dead_letter_consumer.txt \
             fakeredis
 
       - name: Run tests
@@ -90,6 +92,9 @@ jobs:
           context: .
           file: ${{ matrix.service.dockerfile }}
           push: true
+          # Provenance and SBOM attestation blobs cause "unknown blob" failures on GHCR
+          provenance: false
+          sbom: false
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service.name }}:${{ github.sha }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.service.name }}:${{ github.ref_name }}
