@@ -20,6 +20,7 @@ spec:
             prometheus.io/port: "9003"
         spec:
           restartPolicy: OnFailure
+          terminationGracePeriodSeconds: 600
           containers:
             - name: trainer
               image: ghcr.io/YOUR_ORG/recsys-trainer:latest

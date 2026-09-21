@@ -1,1 +1,2 @@
 -r base.txt
+redis>=5.0.0

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     metrics_port: int = 9000
     recommendation_limit_default: int = 10
     api_key: str = ""
+    training_lookback_days: int = 90
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

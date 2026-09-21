@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -9,6 +9,10 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -22,7 +26,7 @@ class User(Base):
     region: Mapped[str] = mapped_column(String(32), index=True)
     preferred_language: Mapped[str] = mapped_column(String(32), default="en")
     maturity_rating: Mapped[str] = mapped_column(String(16), default="PG-13")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class Item(Base):
@@ -40,7 +44,7 @@ class Item(Base):
     maturity_rating: Mapped[str] = mapped_column(String(16), default="PG-13")
     available_regions: Mapped[str] = mapped_column(String(256), default="GLOBAL")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class Interaction(Base):
@@ -54,8 +58,9 @@ class Interaction(Base):
     completion_pct: Mapped[float] = mapped_column(Float, default=0.0)
     region: Mapped[str] = mapped_column(String(32), index=True)
     device_type: Mapped[str] = mapped_column(String(32), default="web")
+    position: Mapped[int] = mapped_column(Integer, default=-1)
     event_ts: Mapped[datetime] = mapped_column(DateTime, index=True)
-    ingestion_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    ingestion_ts: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class ItemNeighbor(Base):
@@ -67,7 +72,7 @@ class ItemNeighbor(Base):
     neighbor_item_id: Mapped[str] = mapped_column(String(64), index=True)
     score: Mapped[float] = mapped_column(Float)
     algorithm: Mapped[str] = mapped_column(String(32), index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class TrendingItem(Base):
@@ -78,7 +83,7 @@ class TrendingItem(Base):
     region: Mapped[str] = mapped_column(String(32), index=True)
     item_id: Mapped[str] = mapped_column(String(64), index=True)
     score: Mapped[float] = mapped_column(Float)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class ModelVersion(Base):
@@ -86,15 +91,20 @@ class ModelVersion(Base):
 
     version: Mapped[str] = mapped_column(String(64), primary_key=True)
     description: Mapped[str] = mapped_column(String(256), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class RankingWeights(Base):
-    """Learned signal weights produced by the trainer after each run."""
+    """Learned signal weights produced by the trainer after each run.
+
+    segment=None means global (all users); segment=region_code means
+    region-specific weights that take priority over global for matching users.
+    """
     __tablename__ = "ranking_weights"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     model_version: Mapped[str] = mapped_column(String(64), index=True)
+    segment: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     collaborative: Mapped[float] = mapped_column(Float, default=0.35)
     content: Mapped[float] = mapped_column(Float, default=0.25)
     session: Mapped[float] = mapped_column(Float, default=0.20)
@@ -102,7 +112,7 @@ class RankingWeights(Base):
     freshness: Mapped[float] = mapped_column(Float, default=0.05)
     genre_bonus: Mapped[float] = mapped_column(Float, default=0.05)
     sample_count: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class ModelEvaluation(Base):
@@ -113,9 +123,15 @@ class ModelEvaluation(Base):
     model_version: Mapped[str] = mapped_column(String(64), index=True)
     ndcg_at_10: Mapped[float] = mapped_column(Float, default=0.0)
     hit_rate_at_10: Mapped[float] = mapped_column(Float, default=0.0)
+    mrr_at_10: Mapped[float] = mapped_column(Float, default=0.0)
+    # Watch-time-weighted offline metric — better proxy for business impact than binary NDCG
+    watch_time_ndcg_at_10: Mapped[float] = mapped_column(Float, default=0.0)
     coverage: Mapped[float] = mapped_column(Float, default=0.0)
     test_user_count: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Business metrics computed over the trailing 7-day window at training time
+    retention_7d: Mapped[float] = mapped_column(Float, default=0.0)
+    avg_attributed_watch_s: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class Experiment(Base):
@@ -128,4 +144,4 @@ class Experiment(Base):
     # JSON dict: {"collaborative": 0.45, "content": 0.20, ...}
     variant_weights: Mapped[str] = mapped_column(Text, default="{}")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)

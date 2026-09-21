@@ -100,3 +100,93 @@ groups:
           description: >
             No events have been consumed for 10 minutes.  Check the
             stream-processor pod and Kafka/Redpanda connectivity.
+
+      - alert: FrequentWeightRollbacks
+        expr: increase(recsys_weight_rollbacks_total[2h]) >= 2
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Trainer is repeatedly rolling back learned weights"
+          description: >
+            {{ $value | printf "%.0f" }} weight rollbacks in the last 2 hours.
+            Each rollback means the new model's NDCG regressed by more than 5%
+            vs the previous run.  Check data quality in the interactions table
+            and recent stream-processor logs for ingestion anomalies.
+
+      - alert: NdcgRegressionRelative
+        expr: >
+          recsys_eval_ndcg_at_10 > 0
+          and
+          (recsys_eval_ndcg_at_10 - recsys_eval_ndcg_at_10 offset 2h)
+            / recsys_eval_ndcg_at_10 offset 2h < -0.10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NDCG@10 dropped more than 10% vs 2 hours ago"
+          description: >
+            NDCG@10 fell from {{ printf "%.3f" (recsys_eval_ndcg_at_10 offset 2h) }}
+            to {{ printf "%.3f" $value }} — a relative drop exceeding 10%.
+            Investigate recent training data or model changes.
+
+      - alert: TrainingDataQualityFailure
+        expr: increase(recsys_training_data_quality_failures_total[1h]) >= 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Training aborted due to data quality failure"
+          description: >
+            A training run was aborted because the interaction data failed
+            quality checks. Check stream-processor logs and the interactions
+            table for timestamp anomalies or missing engagement events.
+
+      - alert: CoverageDeclineTrend
+        expr: recsys_eval_coverage_delta < -0.02
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Catalog coverage declined more than 2% in the last training run"
+          description: >
+            Coverage dropped by {{ printf "%.1f" (mul (abs $value) 100) }}% points
+            in the most recent training run. Consecutive drops indicate a
+            popularity trap forming. Check collaborative neighbor diversity
+            and whether new items are being reached by the seeder.
+
+  - name: recsys.business
+    rules:
+      - alert: RetentionDrop
+        expr: >
+          recsys_retention_7day > 0
+          and recsys_retention_7day < 0.30
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "7-day user retention dropped below 30%"
+          description: >
+            7-day retention is {{ printf "%.1f" (mul $value 100) }}%.
+            This means fewer than 30% of last week's active users returned
+            with an engagement event this week — a leading indicator of
+            subscription churn. Check content freshness, recommendation
+            quality, and whether a recent model rollout degraded engagement.
+
+      - alert: AttributedWatchTimeDrop
+        expr: >
+          recsys_avg_attributed_watch_seconds > 0
+          and (
+            recsys_avg_attributed_watch_seconds
+            - recsys_avg_attributed_watch_seconds offset 2h
+          ) / recsys_avg_attributed_watch_seconds offset 2h < -0.20
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Average attributed watch time dropped more than 20%"
+          description: >
+            Average watch seconds per recommended play fell by more than 20%
+            compared to 2 hours ago (current: {{ printf "%.0f" $value }}s).
+            Check whether new ranking weights are surfacing shorter content
+            or whether completion rates have dropped.

@@ -5,6 +5,10 @@ On first run (or when fewer than 100 items are present) it downloads
 ml-1m.zip, parses movies / users / ratings, and bulk-inserts everything.
 Subsequent runs are a no-op.  Falls back to a small hardcoded catalog
 when the download fails (e.g. CI without network access).
+
+After seeding Postgres, the seeder also backfills Redis so the
+recommendation API sees personalized signals immediately (rather than
+treating every user as cold-start because Redis is empty).
 """
 import io
 import logging
@@ -12,6 +16,7 @@ import re
 import time
 import urllib.request
 import zipfile
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, insert, select, text
@@ -30,9 +35,22 @@ from common.models import (
     TrendingItem,
     User,
 )
+from common.redis_client import get_redis
 
 configure_logging("seeder")
 logger = logging.getLogger(__name__)
+
+_EVENT_WEIGHT = {
+    "impression": 0.1,
+    "click": 0.3,
+    "play_start": 0.8,
+    "watch_progress": 1.2,
+    "complete": 2.0,
+    "watchlist_add": 0.5,
+}
+_REDIS_RECENT_LIMIT = 20
+_GENRE_TTL = 86400 * 30
+_POP_TTL = 86400 * 7
 
 ML1M_URL = "https://files.grouplens.org/datasets/movielens/ml-1m.zip"
 _BATCH_SIZE = 10_000
@@ -275,6 +293,7 @@ def main() -> None:
             total = session.execute(text("SELECT COUNT(*) FROM items")).scalar()
             if total >= _REAL_CATALOG_MIN:
                 logger.info("Already seeded with real data — skipping", extra={"items": total})
+                _backfill_redis()
                 return
             logger.info(
                 "Found small fallback catalog — wiping to reseed with MovieLens 1M",
@@ -292,7 +311,7 @@ def main() -> None:
             "MovieLens download failed — using fallback catalog",
             extra={"error": str(exc)},
         )
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         items = [{**c, "is_active": True, "created_at": now} for c in _FALLBACK_CATALOG]
         users = [{**u, "created_at": now} for u in _FALLBACK_USERS]
         interactions = []
@@ -319,6 +338,91 @@ def main() -> None:
             "interactions": len(interactions),
         },
     )
+
+    _backfill_redis()
+
+
+def _backfill_redis() -> None:
+    """
+    Populate Redis online-feature keys from the Postgres interaction history.
+    Without this, every user appears as cold-start on a fresh deploy because
+    the stream processor hasn't had a chance to write anything to Redis yet.
+    Skips if Redis already has recent-item keys (i.e. not cold).
+    """
+    redis = get_redis()
+    if redis.keys("recent:*"):
+        logger.info("Redis already has recent-item keys — skipping backfill")
+        return
+
+    with SessionLocal() as session:
+        items = session.execute(select(Item)).scalars().all()
+        item_genres: dict[str, str] = {i.item_id: i.genres for i in items}
+
+        rows = session.execute(
+            text(
+                "SELECT user_id, item_id, event_type, completion_pct, watch_seconds, "
+                "       region, extract(epoch from event_ts) as ts "
+                "FROM interactions ORDER BY user_id, event_ts"
+            )
+        ).fetchall()
+
+    if not rows:
+        logger.info("No interactions to backfill into Redis — skipping")
+        return
+
+    logger.info("Backfilling Redis", extra={"interactions": len(rows)})
+
+    user_rows: dict[str, list] = defaultdict(list)
+    region_scores: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for r in rows:
+        user_rows[r.user_id].append(r)
+        weight = _EVENT_WEIGHT.get(r.event_type, 0.1)
+        region_scores[r.region][r.item_id] += weight
+
+    pipe = redis.pipeline()
+    written = 0
+
+    for user_id, ixs in user_rows.items():
+        recent_key = f"recent:{user_id}"
+        watched_key = f"watched:{user_id}"
+        genre_key = f"genre_affinity:{user_id}"
+
+        pipe.delete(recent_key)
+        for r in ixs[-_REDIS_RECENT_LIMIT:]:
+            pipe.zadd(recent_key, {r.item_id: float(r.ts)})
+
+        for r in ixs:
+            if r.event_type == "complete" or (r.completion_pct or 0) >= 5.0 or (r.watch_seconds or 0) >= 120:
+                pipe.sadd(watched_key, r.item_id)
+
+        pipe.delete(genre_key)
+        genre_totals: dict[str, float] = defaultdict(float)
+        for r in ixs:
+            genres = item_genres.get(r.item_id, "")
+            if not genres:
+                continue
+            w = _EVENT_WEIGHT.get(r.event_type, 0.1)
+            for g in genres.split(","):
+                genre_totals[g.strip()] += w
+        if genre_totals:
+            pipe.hset(genre_key, mapping={k: str(round(v, 4)) for k, v in genre_totals.items()})
+        pipe.expire(genre_key, _GENRE_TTL)
+
+        written += 1
+        if written % 500 == 0:
+            pipe.execute()
+            pipe = redis.pipeline()
+            logger.info("Redis backfill progress", extra={"users": written, "total": len(user_rows)})
+
+    for region, scores in region_scores.items():
+        pop_key = f"popular:{region}"
+        pipe.delete(pop_key)
+        for item_id, score in scores.items():
+            pipe.zadd(pop_key, {item_id: round(score, 4)})
+        pipe.expire(pop_key, _POP_TTL)
+
+    pipe.execute()
+    logger.info("Redis backfill complete", extra={"users": written, "regions": len(region_scores)})
 
 
 if __name__ == "__main__":

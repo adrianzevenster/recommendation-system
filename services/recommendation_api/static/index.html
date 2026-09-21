@@ -176,10 +176,108 @@
 
     .legend-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 
-    .legend-weight { margin-left: auto; font-family: monospace; font-size: 10px; }
+    .legend-weight {
+      margin-left: auto;
+      font-family: monospace;
+      font-size: 10px;
+      color: var(--text);
+      transition: color 0.3s;
+    }
+
+    .legend-weight.updated { color: #6ee7b7; }
 
     /* Main content */
     .content { padding: 20px; overflow-y: auto; }
+
+    /* Status pills row */
+    .status-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 9px;
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      border: 1px solid transparent;
+    }
+
+    .pill-cold   { background: rgba(239,68,68,0.1);  color: #fca5a5;  border-color: rgba(239,68,68,0.3); }
+    .pill-cached { background: rgba(16,185,129,0.1); color: #6ee7b7;  border-color: rgba(16,185,129,0.3); }
+    .pill-exp    { background: rgba(245,158,11,0.1); color: #fcd34d;  border-color: rgba(245,158,11,0.3); }
+
+    /* Experiment results card */
+    .exp-card {
+      background: var(--surface);
+      border: 1px solid rgba(245,158,11,0.3);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 16px;
+    }
+
+    .exp-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .exp-card-title { font-size: 12px; font-weight: 700; color: #fcd34d; }
+
+    .exp-sig {
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 700;
+    }
+
+    .exp-sig.yes { background: rgba(16,185,129,0.15); color: #6ee7b7; }
+    .exp-sig.no  { background: rgba(148,163,184,0.1); color: var(--muted); }
+
+    .exp-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .exp-col {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+
+    .exp-col-label {
+      font-size: 9px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    .exp-metric { font-size: 13px; font-weight: 700; font-family: monospace; }
+    .exp-sub    { font-size: 9px; color: var(--muted); margin-top: 1px; }
+
+    .exp-lift-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--muted);
+    }
+
+    .lift-pos { color: #6ee7b7; font-weight: 700; }
+    .lift-neg { color: #fca5a5; font-weight: 700; }
+    .lift-neu { color: var(--muted); font-weight: 700; }
 
     .recent-bar {
       display: flex;
@@ -395,38 +493,7 @@
 
     <div>
       <div class="section-label">Ranking signal weights</div>
-      <div class="legend">
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#6366f1"></div>
-          <span>collaborative</span>
-          <span class="legend-weight">0.35</span>
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#8b5cf6"></div>
-          <span>content</span>
-          <span class="legend-weight">0.25</span>
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#06b6d4"></div>
-          <span>session</span>
-          <span class="legend-weight">0.20</span>
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#f59e0b"></div>
-          <span>trending</span>
-          <span class="legend-weight">0.10</span>
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#10b981"></div>
-          <span>freshness</span>
-          <span class="legend-weight">0.05</span>
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#ec4899"></div>
-          <span>genre bonus</span>
-          <span class="legend-weight">0.05</span>
-        </div>
-      </div>
+      <div class="legend" id="legend"></div>
     </div>
   </aside>
 
@@ -440,13 +507,21 @@
 
 <script>
   const COMPONENTS = {
-    collaborative: { color: '#6366f1', weight: 0.35 },
-    content:       { color: '#8b5cf6', weight: 0.25 },
-    session:       { color: '#06b6d4', weight: 0.20 },
-    trending:      { color: '#f59e0b', weight: 0.10 },
-    freshness:     { color: '#10b981', weight: 0.05 },
-    genre_bonus:   { color: '#ec4899', weight: 0.05 },
+    collaborative: { color: '#6366f1' },
+    content:       { color: '#8b5cf6' },
+    session:       { color: '#06b6d4' },
+    trending:      { color: '#f59e0b' },
+    freshness:     { color: '#10b981' },
+    genre_bonus:   { color: '#ec4899' },
   };
+
+  // Default weights shown until first API response updates them
+  const DEFAULT_WEIGHTS = {
+    collaborative: 0.35, content: 0.25, session: 0.20,
+    trending: 0.10, freshness: 0.05, genre_bonus: 0.05,
+  };
+
+  let liveWeights = { ...DEFAULT_WEIGHTS };
 
   const REASON_COLORS = {
     collaborative: { bg: 'rgba(99,102,241,0.15)',  fg: '#a5b4fc' },
@@ -455,9 +530,11 @@
     trending:      { bg: 'rgba(245,158,11,0.15)',  fg: '#fcd34d' },
     freshness:     { bg: 'rgba(16,185,129,0.15)',  fg: '#6ee7b7' },
     genre_bonus:   { bg: 'rgba(236,72,153,0.15)',  fg: '#f9a8d4' },
+    precomputed:   { bg: 'rgba(148,163,184,0.1)',  fg: '#94a3b8' },
   };
 
   let autoTimer = null;
+  let lastExperimentName = null;
 
   const $ = id => document.getElementById(id);
   const userSelect    = $('user-select');
@@ -469,7 +546,47 @@
   const content       = $('content');
   const modelBadge    = $('model-version');
   const latencyEl     = $('latency-display');
+  const legendEl      = $('legend');
 
+  // ---------------------------------------------------------------------------
+  // Legend — rebuilt whenever live weights arrive
+  // ---------------------------------------------------------------------------
+  function renderLegend(weights, updatedKeys) {
+    legendEl.innerHTML = Object.entries(COMPONENTS).map(([key, cfg]) => {
+      const w = (weights[key] ?? 0).toFixed(2);
+      const label = key === 'genre_bonus' ? 'genre bonus' : key;
+      const flash = updatedKeys?.has(key) ? ' updated' : '';
+      return `<div class="legend-item">
+        <div class="legend-dot" style="background:${cfg.color}"></div>
+        <span>${label}</span>
+        <span class="legend-weight${flash}" id="lw-${key}">${w}</span>
+      </div>`;
+    }).join('');
+
+    // Remove flash class after animation
+    if (updatedKeys?.size) {
+      setTimeout(() => {
+        updatedKeys.forEach(k => {
+          const el = $(`lw-${k}`);
+          if (el) el.classList.remove('updated');
+        });
+      }, 1200);
+    }
+  }
+  renderLegend(liveWeights);
+
+  function updateLegendWeights(newWeights) {
+    const changed = new Set();
+    Object.keys(newWeights).forEach(k => {
+      if (Math.abs((newWeights[k] ?? 0) - (liveWeights[k] ?? 0)) > 0.001) changed.add(k);
+    });
+    liveWeights = { ...liveWeights, ...newWeights };
+    renderLegend(liveWeights, changed);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Users
+  // ---------------------------------------------------------------------------
   async function loadUsers() {
     try {
       const res = await fetch('/users?limit=50');
@@ -494,6 +611,9 @@
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // Recommendations fetch
+  // ---------------------------------------------------------------------------
   async function fetchRecs() {
     fetchBtn.disabled = true;
     fetchBtn.innerHTML = '<span class="spinner"></span>Loading…';
@@ -517,6 +637,9 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Render recommendations
+  // ---------------------------------------------------------------------------
   function render(data) {
     modelBadge.textContent = data.model_version;
 
@@ -524,21 +647,103 @@
     latencyEl.textContent = `${ms} ms`;
     latencyEl.className = ms < 50 ? 'latency-ok' : ms < 200 ? 'latency-warn' : 'latency-slow';
 
+    // Update legend weights from live response
+    if (data.weights) updateLegendWeights(data.weights);
+
     if (!data.recommendations?.length) {
       content.innerHTML = '<div class="empty-state"><p>No recommendations yet.</p><p style="color:#475569">The trainer may still be warming up — try again in a moment.</p></div>';
       return;
     }
 
+    // Status pills
+    const pills = [];
+    if (data.is_cold_start) pills.push(`<span class="status-pill pill-cold">cold start</span>`);
+    if (data.cached)        pills.push(`<span class="status-pill pill-cached">&#9889; cached</span>`);
+    if (data.experiment) {
+      const v = data.experiment.variant === 'variant' ? 'variant' : 'control';
+      pills.push(`<span class="status-pill pill-exp">&#9883; ${data.experiment.name} &middot; ${v}</span>`);
+    }
+    const statusRow = pills.length
+      ? `<div class="status-row">${pills.join('')}</div>`
+      : '';
+
+    // Recent items
     const recent = (data.recent_items || [])
       .map(id => `<span class="chip">${id}</span>`).join('');
-
     const recentBar = recent
       ? `<div class="recent-bar"><span class="recent-label">Recently watched</span>${recent}</div>`
       : '';
 
-    content.innerHTML = recentBar + `<div class="cards">${data.recommendations.map(renderCard).join('')}</div>`;
+    const cards = `<div class="cards">${data.recommendations.map(renderCard).join('')}</div>`;
+
+    content.innerHTML = statusRow + recentBar + cards;
+
+    // If an experiment is active, load its results into a panel above the cards
+    if (data.experiment?.name && data.experiment.name !== lastExperimentName) {
+      lastExperimentName = data.experiment.name;
+    }
+    if (data.experiment?.name) {
+      fetchExperimentResults(data.experiment.name);
+    }
   }
 
+  // ---------------------------------------------------------------------------
+  // Experiment results panel
+  // ---------------------------------------------------------------------------
+  async function fetchExperimentResults(name) {
+    try {
+      const res = await fetch(`/experiments/${name}/results`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const panel = renderExperimentPanel(data);
+
+      // Insert before the cards grid
+      const cardsEl = content.querySelector('.cards');
+      if (cardsEl) {
+        const div = document.createElement('div');
+        div.innerHTML = panel;
+        content.insertBefore(div.firstChild, cardsEl);
+      }
+    } catch (_) {}
+  }
+
+  function renderExperimentPanel(d) {
+    const ctrl = d.control;
+    const vari = d.variant;
+    const sig = d.significant;
+
+    const liftClass = d.engagement_lift_pct > 0 ? 'lift-pos' : d.engagement_lift_pct < 0 ? 'lift-neg' : 'lift-neu';
+    const liftSign  = d.engagement_lift_pct > 0 ? '+' : '';
+    const ctrClass  = d.ctr_lift_pct > 0 ? 'lift-pos' : d.ctr_lift_pct < 0 ? 'lift-neg' : 'lift-neu';
+    const ctrSign   = d.ctr_lift_pct > 0 ? '+' : '';
+
+    return `<div class="exp-card">
+      <div class="exp-card-header">
+        <div class="exp-card-title">&#9883; Experiment &mdash; ${d.name}</div>
+        <span class="exp-sig ${sig ? 'yes' : 'no'}">${sig ? 'significant' : 'not significant'}</span>
+      </div>
+      <div class="exp-grid">
+        <div class="exp-col">
+          <div class="exp-col-label">Control</div>
+          <div class="exp-metric">${(ctrl.engagement_rate * 100).toFixed(1)}%</div>
+          <div class="exp-sub">engagement &middot; ${ctrl.users} users &middot; ${ctrl.impressions} impressions</div>
+        </div>
+        <div class="exp-col">
+          <div class="exp-col-label">Variant</div>
+          <div class="exp-metric">${(vari.engagement_rate * 100).toFixed(1)}%</div>
+          <div class="exp-sub">engagement &middot; ${vari.users} users &middot; ${vari.impressions} impressions</div>
+        </div>
+      </div>
+      <div class="exp-lift-row">
+        <span>Engagement lift: <span class="${liftClass}">${liftSign}${d.engagement_lift_pct}%</span> (z&nbsp;=&nbsp;${d.engagement_z_score})</span>
+        <span>CTR lift: <span class="${ctrClass}">${ctrSign}${d.ctr_lift_pct}%</span> (z&nbsp;=&nbsp;${d.ctr_z_score})</span>
+      </div>
+    </div>`;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Recommendation card
+  // ---------------------------------------------------------------------------
   function renderCard(rec, i) {
     const genres = rec.genres.map(g => `<span class="genre-chip">${g.trim()}</span>`).join('');
     const rc = REASON_COLORS[rec.reason] || REASON_COLORS.content;
@@ -549,11 +754,12 @@
     const bars = Object.entries(COMPONENTS).map(([key, cfg]) => {
       const raw = rec.components?.[key] ?? 0;
       const pct = Math.round(raw * 100);
+      const w   = liveWeights[key] ?? 0;
       const label = key === 'genre_bonus' ? 'genre bonus' : key;
       return `<div class="bar-row">
         <div class="bar-label">${label}</div>
         <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${cfg.color}"></div></div>
-        <div class="bar-val">${raw.toFixed(2)}×${cfg.weight}</div>
+        <div class="bar-val">${raw.toFixed(2)}&times;${w.toFixed(2)}</div>
       </div>`;
     }).join('');
 

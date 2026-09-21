@@ -85,15 +85,16 @@ class TestOnlineFeatureUpdate:
         self._process(db, rdb, _event("complete", watch_seconds=6600, completion_pct=100.0))
         assert "m1" in rdb.zrange("recent:u1", 0, -1)
 
-    def test_complete_event_adds_to_watched_set(self, db, rdb):
+    def test_complete_event_adds_to_watched_zset(self, db, rdb):
         _seed_item(db)
         self._process(db, rdb, _event("complete", watch_seconds=6600, completion_pct=100.0))
-        assert rdb.sismember("watched:u1", "m1")
+        # watched: is now a ZSET — check membership via zscore
+        assert rdb.zscore("watched:u1", "m1") is not None
 
-    def test_impression_does_not_add_to_watched_set(self, db, rdb):
+    def test_impression_does_not_add_to_watched_zset(self, db, rdb):
         _seed_item(db)
         self._process(db, rdb, _event("impression"))
-        assert not rdb.sismember("watched:u1", "m1")
+        assert rdb.zscore("watched:u1", "m1") is None
         assert "m1" in rdb.zrange("recent:u1", 0, -1)
 
     def test_genre_affinity_incremented_for_each_genre(self, db, rdb):
@@ -128,7 +129,7 @@ class TestOnlineFeatureUpdate:
         _seed_item(db)
         # 10% completion, 300 seconds (≥ 120 threshold)
         self._process(db, rdb, _event("watch_progress", watch_seconds=300, completion_pct=10.0))
-        assert rdb.sismember("watched:u1", "m1")
+        assert rdb.zscore("watched:u1", "m1") is not None
 
     def test_recent_set_is_capped_at_twenty(self, db, rdb):
         for i in range(25):
