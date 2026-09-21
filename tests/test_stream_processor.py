@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from services.stream_processor.app import (
+    ensure_bucket,
     persist_interaction,
     save_raw_event,
     update_online_features,
@@ -168,3 +169,88 @@ class TestUpdateOnlineFeatures:
             calls = [c[0][1] for c in mock_redis.hincrbyfloat.call_args_list]
             assert "sci-fi" in calls
             assert "thriller" in calls
+
+    def test_play_start_with_low_completion_does_not_add_to_watched(self):
+        session = MagicMock()
+        session.get.return_value = SimpleNamespace(item_id="m1", genres="drama")
+        with patch("services.stream_processor.app.redis_client") as mock_redis:
+            event = self._make_event(event_type="play_start", completion_pct=1.0, watch_seconds=10)
+            update_online_features(session, event)
+            watched_calls = [c for c in mock_redis.zadd.call_args_list if c[0][0] == "watched:u1"]
+            assert len(watched_calls) == 0
+
+    def test_watch_progress_with_high_completion_adds_to_watched(self):
+        session = MagicMock()
+        session.get.return_value = SimpleNamespace(item_id="m1", genres="drama")
+        with patch("services.stream_processor.app.redis_client") as mock_redis:
+            event = self._make_event(event_type="watch_progress", completion_pct=80.0, watch_seconds=3000)
+            update_online_features(session, event)
+            watched_calls = [c for c in mock_redis.zadd.call_args_list if c[0][0] == "watched:u1"]
+            assert len(watched_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# _handle_signal
+# ---------------------------------------------------------------------------
+
+class TestHandleSignal:
+    def test_sets_stop_event(self):
+        from services.stream_processor.app import _handle_signal, _stop
+        _stop.clear()
+        _handle_signal(15, None)
+        assert _stop.is_set()
+        _stop.clear()
+
+
+# ---------------------------------------------------------------------------
+# ensure_bucket
+# ---------------------------------------------------------------------------
+
+class TestEnsureBucket:
+    def test_does_not_create_bucket_when_head_succeeds(self):
+        s3 = MagicMock()
+        s3.head_bucket.return_value = {}
+        ensure_bucket(s3)
+        s3.create_bucket.assert_not_called()
+
+    def test_creates_bucket_when_head_raises(self):
+        from common.config import settings
+        s3 = MagicMock()
+        s3.head_bucket.side_effect = Exception("NoSuchBucket")
+        ensure_bucket(s3)
+        s3.create_bucket.assert_called_once_with(Bucket=settings.minio_bucket)
+
+
+# ---------------------------------------------------------------------------
+# make_consumer / make_s3_client / make_producer
+# ---------------------------------------------------------------------------
+
+class TestFactoryFunctions:
+    def test_make_consumer_returns_consumer(self):
+        from services.stream_processor.app import make_consumer
+        mock_consumer = MagicMock()
+        with patch("services.stream_processor.app.Consumer", return_value=mock_consumer):
+            result = make_consumer()
+        assert result is mock_consumer
+
+    def test_make_consumer_uses_kafka_settings(self):
+        from services.stream_processor.app import make_consumer
+        from common.config import settings
+        with patch("services.stream_processor.app.Consumer") as mock_cls:
+            make_consumer()
+        config = mock_cls.call_args[0][0]
+        assert config["bootstrap.servers"] == settings.kafka_bootstrap_servers
+
+    def test_make_s3_client_returns_client(self):
+        from services.stream_processor.app import make_s3_client
+        mock_client = MagicMock()
+        with patch("services.stream_processor.app.boto3.client", return_value=mock_client):
+            result = make_s3_client()
+        assert result is mock_client
+
+    def test_make_producer_returns_producer(self):
+        from services.stream_processor.app import make_producer
+        mock_producer = MagicMock()
+        with patch("confluent_kafka.Producer", return_value=mock_producer):
+            result = make_producer()
+        assert result is mock_producer
