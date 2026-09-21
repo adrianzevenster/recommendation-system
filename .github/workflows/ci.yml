@@ -36,7 +36,7 @@ jobs:
             fakeredis
 
       - name: Run tests
-        run: pytest tests/ -v --cov=common --cov=services --cov-report=term-missing
+        run: pytest tests/ -v --cov=common --cov=services --cov-report=term-missing --cov-fail-under=55
 
   build:
     runs-on: ubuntu-latest

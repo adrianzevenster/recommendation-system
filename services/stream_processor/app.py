@@ -1,5 +1,6 @@
 import json
 import logging
+import signal
 import threading
 import time
 from collections import defaultdict
@@ -24,6 +25,13 @@ configure_logging(SERVICE_NAME)
 logger = logging.getLogger(__name__)
 tracer = setup_tracing(SERVICE_NAME)
 redis_client = get_redis()
+
+_stop = threading.Event()
+
+
+def _handle_signal(signum, frame):
+    logger.info("Signal received — draining current message then stopping", extra={"signal": signum})
+    _stop.set()
 
 
 def make_consumer() -> Consumer:
@@ -91,7 +99,7 @@ def persist_interaction(session, event: dict) -> bool:
         user_id=event["user_id"],
         item_id=event["item_id"],
         event_type=event["event_type"],
-        event_ts=datetime.fromisoformat(event["event_ts"].replace("Z", "+00:00")),
+        event_ts=datetime.fromisoformat(event["event_ts"].replace("Z", "+00:00")).replace(tzinfo=None),
         watch_seconds=int(event.get("watch_seconds") or 0),
         completion_pct=float(event.get("completion_pct") or 0.0),
         region=event.get("region"),
@@ -121,7 +129,12 @@ def update_online_features(session, event: dict) -> None:
 
     if event_type in {"play_start", "watch_progress", "complete"}:
         if completion_pct >= 5.0 or watch_seconds >= 120 or event_type == "complete":
-            redis_client.sadd(watched_key, event["item_id"])
+            # Watched set is a ZSET keyed by event timestamp so we can trim old entries.
+            # NX=True avoids updating the score if the item was already watched (keep oldest ts).
+            redis_client.zadd(watched_key, {event["item_id"]: event_ts}, nx=True)
+            # Prune entries older than 180 days to keep the set bounded
+            cutoff_ts = event_ts - (86400 * 180)
+            redis_client.zremrangebyscore(watched_key, "-inf", cutoff_ts)
 
     increment = {
         "impression": 0.1,
@@ -150,6 +163,8 @@ def make_producer():
 
 
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
     threading.Thread(target=serve_metrics, daemon=True).start()
     wait_for_dependencies()
     Base.metadata.create_all(bind=engine)
@@ -160,7 +175,7 @@ def main() -> None:
     dlq_producer = make_producer()
 
     try:
-        while True:
+        while not _stop.is_set():
             msg = consumer.poll(1.0)
             if msg is None:
                 continue

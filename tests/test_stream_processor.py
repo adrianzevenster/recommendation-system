@@ -133,25 +133,32 @@ class TestUpdateOnlineFeatures:
         session.get.return_value = SimpleNamespace(item_id="m1", genres="sci-fi,thriller")
         with patch("services.stream_processor.app.redis_client") as mock_redis:
             update_online_features(session, self._make_event())
-            mock_redis.zadd.assert_called_once()
-            key = mock_redis.zadd.call_args[0][0]
-            assert key == "recent:u1"
+            recent_calls = [c for c in mock_redis.zadd.call_args_list if c[0][0] == "recent:u1"]
+            assert len(recent_calls) == 1
 
-    def test_complete_event_adds_to_watched_set(self):
+    def test_complete_event_adds_to_watched_zset(self):
         session = MagicMock()
         session.get.return_value = SimpleNamespace(item_id="m1", genres="sci-fi")
         with patch("services.stream_processor.app.redis_client") as mock_redis:
             update_online_features(session, self._make_event(event_type="complete", completion_pct=100.0))
-            mock_redis.sadd.assert_called_once()
-            assert "watched:u1" in mock_redis.sadd.call_args[0]
+            # watched: is now a ZSET — assert zadd was called with the watched key
+            watched_zadd_calls = [
+                c for c in mock_redis.zadd.call_args_list
+                if c[0][0] == "watched:u1"
+            ]
+            assert len(watched_zadd_calls) == 1
 
-    def test_impression_does_not_add_to_watched_set(self):
+    def test_impression_does_not_add_to_watched_zset(self):
         session = MagicMock()
         session.get.return_value = SimpleNamespace(item_id="m1", genres="sci-fi")
         with patch("services.stream_processor.app.redis_client") as mock_redis:
             update_online_features(session, self._make_event(event_type="impression",
                                                               completion_pct=0.0, watch_seconds=0))
-            mock_redis.sadd.assert_not_called()
+            watched_zadd_calls = [
+                c for c in mock_redis.zadd.call_args_list
+                if c[0][0] == "watched:u1"
+            ]
+            assert len(watched_zadd_calls) == 0
 
     def test_genre_affinity_updated_for_each_genre(self):
         session = MagicMock()

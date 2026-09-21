@@ -16,6 +16,8 @@ def _interaction(**kwargs):
         item_id="m1",
         event_type="click",
         completion_pct=0.0,
+        position=-1,
+        watch_seconds=0,
         event_ts=datetime.now(timezone.utc),
         region="US",
     )
@@ -52,6 +54,20 @@ class TestInteractionWeight:
 
     def test_unknown_event_type_returns_minimum(self):
         assert interaction_weight("unknown_xyz", 0.0) == 0.1
+
+    def test_position_minus_one_applies_no_discount(self):
+        assert interaction_weight("click", 0.0, position=-1) == interaction_weight("click", 0.0)
+
+    def test_position_two_applies_discount(self):
+        # position=2 gives discount 1/log2(3) ≈ 0.63; position=-1 gives no discount
+        w_no_pos = interaction_weight("click", 0.0)
+        w_pos2 = interaction_weight("click", 0.0, position=2)
+        assert w_pos2 < w_no_pos
+
+    def test_higher_position_means_lower_weight(self):
+        w1 = interaction_weight("complete", 0.0, position=1)
+        w5 = interaction_weight("complete", 0.0, position=5)
+        assert w1 > w5
 
 
 class TestBuildCollaborativeNeighbors:
@@ -119,14 +135,23 @@ class TestBuildCollaborativeNeighbors:
 
 class TestBuildContentNeighbors:
     def test_empty_items_returns_empty(self):
-        assert build_content_neighbors([]) == []
+        neighbors, vec = build_content_neighbors([])
+        assert neighbors == [] and vec is None
+
+    def test_returns_neighbors_and_vectorizer(self):
+        items = [
+            _item(item_id="m1", title="Alpha drama", genres="drama", actors="A", director="D", synopsis="Story"),
+            _item(item_id="m2", title="Beta drama", genres="drama", actors="B", director="E", synopsis="Tale"),
+        ]
+        neighbors, vec = build_content_neighbors(items)
+        assert vec is not None
 
     def test_self_never_appears_as_own_neighbor(self):
         items = [
             _item(item_id="m1", title="Alpha drama", genres="drama", actors="A", director="D", synopsis="Story"),
             _item(item_id="m2", title="Beta drama", genres="drama", actors="B", director="E", synopsis="Tale"),
         ]
-        results = build_content_neighbors(items)
+        results, _ = build_content_neighbors(items)
         for source, neighbor, _, _ in results:
             assert source != neighbor
 
@@ -136,7 +161,7 @@ class TestBuildContentNeighbors:
             _item(item_id="m2", title="Sci-fi Adventure", genres="sci-fi,adventure", synopsis="Space travel"),
             _item(item_id="m3", title="Romance Drama", genres="romance,drama", synopsis="Love story"),
         ]
-        results = build_content_neighbors(items, top_k=2)
+        results, _ = build_content_neighbors(items, top_k=2)
         m1_neighbors = {r[1] for r in results if r[0] == "m1"}
         assert "m2" in m1_neighbors
 
@@ -145,12 +170,12 @@ class TestBuildContentNeighbors:
             _item(item_id="m1", title="One", genres="drama"),
             _item(item_id="m2", title="Two", genres="drama"),
         ]
-        results = build_content_neighbors(items)
+        results, _ = build_content_neighbors(items)
         assert all(r[3] == "content" for r in results)
 
     def test_top_k_limits_neighbors_per_item(self):
         items = [_item(item_id=f"m{i}", title=f"Movie {i}", genres="action") for i in range(6)]
-        results = build_content_neighbors(items, top_k=3)
+        results, _ = build_content_neighbors(items, top_k=3)
         m0_neighbors = [r for r in results if r[0] == "m0"]
         assert len(m0_neighbors) <= 3
 
@@ -217,3 +242,115 @@ class TestBuildTrending:
         results = build_trending(interactions)
         scores = {r[1]: r[2] for r in results if r[0] == "US"}
         assert scores["m1"] > scores["m2"]
+
+
+# ---------------------------------------------------------------------------
+# _score_user_candidates_offline
+# ---------------------------------------------------------------------------
+
+from services.trainer.app import _score_user_candidates_offline
+
+_WEIGHTS = [0.35, 0.25, 0.20, 0.10, 0.05, 0.05]
+
+
+def _candidate_item(item_id, genres="drama", release_year=2024, regions="GLOBAL",
+                    active=True, maturity="PG-13"):
+    return SimpleNamespace(
+        item_id=item_id, genres=genres, release_year=release_year,
+        available_regions=regions, is_active=active, maturity_rating=maturity,
+    )
+
+
+class TestScoreUserCandidatesOffline:
+    def _base_maps(self):
+        item_map = {
+            "m1": _candidate_item("m1", genres="sci-fi"),
+            "m2": _candidate_item("m2", genres="drama"),
+            "m3": _candidate_item("m3", genres="comedy"),
+        }
+        collab_map = {"seed": {"m1": 1.0}}
+        content_map = {"seed": {"m2": 1.0}}
+        trending_map = {"US": {"m3": 1.0}}
+        return item_map, collab_map, content_map, trending_map
+
+    def test_returns_scored_dicts_with_required_keys(self):
+        item_map, collab, content, trending = self._base_maps()
+        result = _score_user_candidates_offline(
+            "US", "PG-13", ["seed"], item_map, collab, content, trending, _WEIGHTS
+        )
+        assert all({"item_id", "score", "reason", "components"} <= set(r.keys()) for r in result)
+
+    def test_inactive_items_excluded(self):
+        item_map = {
+            "m1": _candidate_item("m1", active=False),
+            "m2": _candidate_item("m2"),
+        }
+        result = _score_user_candidates_offline(
+            "US", "PG-13", ["seed"], item_map, {"seed": {"m1": 1.0, "m2": 0.5}},
+            {}, {}, _WEIGHTS
+        )
+        assert not any(r["item_id"] == "m1" for r in result)
+
+    def test_wrong_region_excluded(self):
+        item_map = {
+            "m1": _candidate_item("m1", regions="UK"),
+            "m2": _candidate_item("m2", regions="GLOBAL"),
+        }
+        result = _score_user_candidates_offline(
+            "US", "PG-13", ["seed"], item_map, {"seed": {"m1": 1.0, "m2": 0.8}},
+            {}, {}, _WEIGHTS
+        )
+        assert not any(r["item_id"] == "m1" for r in result)
+        assert any(r["item_id"] == "m2" for r in result)
+
+    def test_mature_content_excluded_for_pg_user(self):
+        item_map = {
+            "m1": _candidate_item("m1", maturity="R"),
+            "m2": _candidate_item("m2", maturity="PG"),
+        }
+        result = _score_user_candidates_offline(
+            "US", "PG-13", ["seed"], item_map, {"seed": {"m1": 1.0, "m2": 0.9}},
+            {}, {}, _WEIGHTS
+        )
+        assert not any(r["item_id"] == "m1" for r in result)
+        assert any(r["item_id"] == "m2" for r in result)
+
+    def test_results_sorted_descending_by_score(self):
+        item_map, collab, content, trending = self._base_maps()
+        result = _score_user_candidates_offline(
+            "US", "PG-13", ["seed"], item_map, collab, content, trending, _WEIGHTS
+        )
+        scores = [r["score"] for r in result]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_empty_history_uses_trending_signal(self):
+        item_map = {"m1": _candidate_item("m1")}
+        result = _score_user_candidates_offline(
+            "US", "PG-13", [], item_map, {}, {}, {"US": {"m1": 1.0}}, _WEIGHTS
+        )
+        assert any(r["item_id"] == "m1" for r in result)
+
+    def test_genre_affinity_increases_score_for_matching_genre(self):
+        item_map = {
+            "m1": _candidate_item("m1", genres="sci-fi"),
+            "m2": _candidate_item("m2", genres="drama"),
+        }
+        collab = {"seed": {"m1": 1.0, "m2": 1.0}}
+        weights = [0.35, 0.25, 0.20, 0.10, 0.05, 0.05]
+
+        base = _score_user_candidates_offline("US", "PG-13", ["seed"], item_map, collab, {}, {}, weights)
+        with_affinity = _score_user_candidates_offline(
+            "US", "PG-13", ["seed"], item_map, collab, {}, {}, weights,
+            genre_affinity={"sci-fi": 10.0},
+        )
+        base_m1 = next(r["score"] for r in base if r["item_id"] == "m1")
+        boosted_m1 = next(r["score"] for r in with_affinity if r["item_id"] == "m1")
+        assert boosted_m1 > base_m1
+
+    def test_genre_affinity_stored_in_components(self):
+        item_map = {"m1": _candidate_item("m1", genres="sci-fi")}
+        result = _score_user_candidates_offline(
+            "US", "PG-13", [], item_map, {}, {}, {"US": {"m1": 1.0}}, _WEIGHTS,
+            genre_affinity={"sci-fi": 10.0},
+        )
+        assert result[0]["components"]["genre_bonus"] > 0.0
