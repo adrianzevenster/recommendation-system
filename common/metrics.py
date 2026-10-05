@@ -123,6 +123,16 @@ ATTRIBUTED_WATCH_TIME_SECONDS = Counter(
     "Cumulative watch_seconds for recommendation-attributed plays (position > 0)",
 )
 
+# Distribution shift detection — updated on every training run (before quality gate)
+COMPLETION_RATE = Gauge(
+    "recsys_completion_rate",
+    "Fraction of play_start events that result in complete events in the training window",
+)
+EVENT_VOLUME = Gauge(
+    "recsys_event_volume_training_window",
+    "Total interaction events loaded in the current training window",
+)
+
 # Dead-letter queue consumer metrics
 DLQ_EVENTS_ARCHIVED = Counter(
     "recsys_dlq_events_archived_total",

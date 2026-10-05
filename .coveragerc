@@ -1,0 +1,11 @@
+[run]
+omit =
+    # Requires network access (MovieLens download) — tested end-to-end via docker-compose
+    services/seeder/app.py
+    # Utility module not yet consumed by any service
+    common/utils.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:

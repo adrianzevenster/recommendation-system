@@ -190,3 +190,38 @@ groups:
             compared to 2 hours ago (current: {{ printf "%.0f" $value }}s).
             Check whether new ranking weights are surfacing shorter content
             or whether completion rates have dropped.
+
+  - name: recsys.distribution_shift
+    rules:
+      - alert: CompletionRateDrop
+        expr: recsys_completion_rate > 0 and recsys_completion_rate < 0.03
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Completion rate dropped below 3%"
+          description: >
+            Only {{ printf "%.1f" (mul $value 100) }}% of play_start events
+            result in complete events in the training window.  This indicates
+            users are abandoning content early or there is a pipeline issue
+            dropping complete events.  Training will be blocked until this
+            recovers above the threshold.
+
+      - alert: EventVolumeDrop
+        expr: >
+          recsys_event_volume_training_window > 0
+          and (
+            recsys_event_volume_training_window
+            - recsys_event_volume_training_window offset 2h
+          ) / recsys_event_volume_training_window offset 2h < -0.50
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Training window event volume dropped more than 50%"
+          description: >
+            Event volume in the training window dropped from
+            {{ printf "%.0f" (recsys_event_volume_training_window offset 2h) }}
+            to {{ printf "%.0f" $value }} — more than 50% in 2 hours.
+            Check stream-processor logs and Kafka/Redpanda connectivity for
+            ingestion failures.
