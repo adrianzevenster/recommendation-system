@@ -145,3 +145,8 @@ class Experiment(Base):
     variant_weights: Mapped[str] = mapped_column(Text, default="{}")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    # Lifecycle fields — set when the experiment concludes (auto or manual)
+    max_duration_days: Mapped[int] = mapped_column(Integer, default=14)
+    concluded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    winning_variant: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    conclusion_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)

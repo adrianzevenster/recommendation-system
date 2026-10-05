@@ -43,6 +43,7 @@ from common.models import (
     TrendingItem,
     User,
 )
+from common.ann import deserialize_index, query_index
 from common.redis_client import get_redis
 from common.telemetry import instrument_fastapi
 
@@ -62,10 +63,12 @@ _COLD_START_THRESHOLD = 3
 _CACHE_TTL_SECONDS = 60.0
 # Items watched more than 180 days ago are eligible for re-recommendation
 _WATCHED_WINDOW_DAYS = 180
+# ANN index is refreshed at most every 5 minutes (warm cache) to amortise MinIO latency
+_ANN_CACHE_TTL_SECONDS = 300.0
 
 
 # ---------------------------------------------------------------------------
-# In-memory caches for ranking weights and active experiment
+# In-memory caches for ranking weights, active experiment, and ANN index
 # ---------------------------------------------------------------------------
 
 # Keyed by segment (region string or None for global).
@@ -73,38 +76,93 @@ _WATCHED_WINDOW_DAYS = 180
 _weights_cache: dict[str | None, dict] = {}
 _weights_lock = threading.Lock()
 
+# ANN index cache — double-checked locking, same pattern as weights cache
+_ann_cache: dict = {"index": None, "id_list": [], "ts": 0.0}
+_ann_lock = threading.Lock()
+
+
+def _get_s3_client():
+    import boto3
+    from botocore.config import Config as BotoCoreConfig
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.minio_endpoint,
+        aws_access_key_id=settings.minio_access_key,
+        aws_secret_access_key=settings.minio_secret_key,
+        config=BotoCoreConfig(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+
+
+def _load_ann_index():
+    """Load FAISS index from MinIO with TTL-based refresh. Returns (index, id_list)."""
+    now = time.time()
+    # Fast path — return cached index if still fresh
+    if _ann_cache["index"] is not None and now - _ann_cache["ts"] < _ANN_CACHE_TTL_SECONDS:
+        return _ann_cache["index"], _ann_cache["id_list"]
+    with _ann_lock:
+        # Re-check after acquiring lock
+        if _ann_cache["index"] is not None and now - _ann_cache["ts"] < _ANN_CACHE_TTL_SECONDS:
+            return _ann_cache["index"], _ann_cache["id_list"]
+        try:
+            client = _get_s3_client()
+            # Resolve latest version via manifest
+            resp = client.get_object(Bucket="models", Key="latest.json")
+            manifest = json.loads(resp["Body"].read())
+            version = manifest["version"]
+
+            idx_resp = client.get_object(Bucket="models", Key=f"trainer/{version}/ann_index.faiss")
+            index = deserialize_index(idx_resp["Body"].read())
+
+            ids_resp = client.get_object(Bucket="models", Key=f"trainer/{version}/ann_index_ids.json")
+            id_list = json.loads(ids_resp["Body"].read())
+
+            _ann_cache["index"] = index
+            _ann_cache["id_list"] = id_list
+            _ann_cache["ts"] = now
+            logger.info("Loaded ANN index", extra={"version": version, "items": len(id_list)})
+        except Exception as exc:
+            logger.debug("ANN index not available", extra={"error": str(exc)})
+    return _ann_cache["index"], _ann_cache["id_list"]
+
 _exp_cache: dict = {"data": None, "ts": 0.0}
 _exp_lock = threading.Lock()
 
 
-def _load_ranking_weights(session, segment: str | None = None) -> list[float]:
-    """Return ranking weights for the given segment, falling back to global then defaults.
+def _load_ranking_weights(
+    session,
+    segment: str | None = None,
+    primary: str | None = None,
+) -> list[float]:
+    """Return ranking weights using priority: primary → segment → global → defaults.
 
-    Uses double-checked locking: stale data is served immediately without
-    acquiring the lock; only the refresh path holds the lock.
+    `primary` is intended for device-type keys (e.g. ``"device:mobile"``).
+    Uses double-checked locking so stale data is served without acquiring the
+    lock; only the refresh path holds it.
     """
     now = time.monotonic()
-    # Fast path: serve cached data without acquiring the lock
-    entry = _weights_cache.get(segment)
+    cache_key = (primary, segment)
+    entry = _weights_cache.get(cache_key)
     if entry and now - entry["ts"] <= _CACHE_TTL_SECONDS:
         return entry["data"]
 
     with _weights_lock:
-        # Re-check after acquiring lock — another thread may have refreshed
-        entry = _weights_cache.get(segment)
+        entry = _weights_cache.get(cache_key)
         if entry and now - entry["ts"] <= _CACHE_TTL_SECONDS:
             return entry["data"]
 
-        # Try segment-specific weights first
+        # Try each segment in priority order, stop on first DB hit
         row = None
-        if segment:
+        for seg in filter(None, [primary, segment]):
             row = session.execute(
                 select(RankingWeights)
-                .where(RankingWeights.segment == segment)
+                .where(RankingWeights.segment == seg)
                 .order_by(desc(RankingWeights.created_at))
             ).scalars().first()
+            if row:
+                break
 
-        # Fall back to global weights (segment IS NULL)
+        # Final fallback: global weights (segment IS NULL)
         if not row:
             row = session.execute(
                 select(RankingWeights)
@@ -117,9 +175,9 @@ def _load_ranking_weights(session, segment: str | None = None) -> list[float]:
              row.trending, row.freshness, row.genre_bonus]
             if row else DEFAULT_WEIGHTS[:]
         )
-        _weights_cache[segment] = {"data": data, "ts": now}
+        _weights_cache[cache_key] = {"data": data, "ts": now}
 
-    return _weights_cache[segment]["data"]
+    return _weights_cache[cache_key]["data"]
 
 
 def _load_active_experiment(session):
@@ -199,23 +257,40 @@ def get_latest_model_version(session) -> str:
 
 
 def fetch_candidate_scores(session, recent_items: list[str], region: str):
-    """Fetch collaborative, content, and trending scores in two queries instead of three."""
+    """Fetch collaborative, content, and trending scores.
+
+    Collaborative signal is sourced from the FAISS ANN index when available
+    (sub-millisecond, scales to millions of items).  Falls back to the DB
+    neighbour table when the index hasn't been built yet (e.g. first run).
+    """
     collab: Counter = Counter()
     content: Counter = Counter()
     trending: Counter = Counter()
 
     if recent_items:
-        # Single query for both collaborative and content neighbours
+        # --- Collaborative: prefer ANN index over DB lookup ---
+        ann_index, ann_id_list = _load_ann_index()
+        if ann_index is not None and ann_id_list:
+            ann_scores = query_index(ann_index, ann_id_list, recent_items, k=100)
+            collab.update(ann_scores)
+        else:
+            # DB fallback for collaborative signal
+            for row in session.execute(
+                select(ItemNeighbor).where(
+                    ItemNeighbor.source_item_id.in_(recent_items),
+                    ItemNeighbor.algorithm == "collaborative",
+                )
+            ).scalars().all():
+                collab[row.neighbor_item_id] += row.score
+
+        # Content signal stays in DB (TF-IDF vectors aren't in the ANN index)
         for row in session.execute(
             select(ItemNeighbor).where(
                 ItemNeighbor.source_item_id.in_(recent_items),
-                ItemNeighbor.algorithm.in_(["collaborative", "content"]),
+                ItemNeighbor.algorithm == "content",
             )
         ).scalars().all():
-            if row.algorithm == "collaborative":
-                collab[row.neighbor_item_id] += row.score
-            else:
-                content[row.neighbor_item_id] += row.score
+            content[row.neighbor_item_id] += row.score
 
     for row in session.execute(
         select(TrendingItem).where(TrendingItem.region == region)
@@ -441,15 +516,38 @@ def _z_test_two_proportions(
 # ---------------------------------------------------------------------------
 
 def _build_cold_start_response(session, user: User, limit: int) -> list[dict[str, Any]]:
-    """Serve regional trending for users with no watch history; fall back to freshest items."""
+    """Serve cold-start recommendations blending trending, new items, and genre affinity."""
+    from datetime import datetime, timedelta, timezone
+
+    # Genre affinity from Redis — may be empty for brand-new users
+    genre_affinity = {
+        k: float(v)
+        for k, v in redis_client.hgetall(f"genre_affinity:{user.user_id}").items()
+    }
+
+    # Regional trending items
     trending_rows = session.execute(
         select(TrendingItem)
         .where(TrendingItem.region == user.region)
         .order_by(desc(TrendingItem.score))
         .limit(limit * 3)
     ).scalars().all()
+    trending_scores = {r.item_id: r.score for r in trending_rows}
 
-    if not trending_rows:
+    # New items added in the last 30 days — injected to surface recent catalog additions
+    cutoff_30d = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=30)
+    new_items = session.execute(
+        select(Item)
+        .where(Item.is_active.is_(True), Item.created_at >= cutoff_30d)
+        .limit(limit * 2)
+    ).scalars().all()
+
+    # Merge candidates preserving insertion order (trending first, then new items)
+    candidate_ids = list(dict.fromkeys(
+        [r.item_id for r in trending_rows] + [i.item_id for i in new_items]
+    ))
+
+    if not candidate_ids:
         raw_items = session.execute(
             select(Item)
             .where(Item.is_active.is_(True))
@@ -457,16 +555,17 @@ def _build_cold_start_response(session, user: User, limit: int) -> list[dict[str
             .limit(limit * 3)
         ).scalars().all()
         item_map = {i.item_id: i for i in raw_items}
-        candidates = [(i.item_id, 0.0) for i in raw_items]
+        candidate_ids = [i.item_id for i in raw_items]
     else:
-        item_ids = [r.item_id for r in trending_rows]
-        items = session.execute(select(Item).where(Item.item_id.in_(item_ids))).scalars().all()
-        item_map = {i.item_id: i for i in items}
-        candidates = [(r.item_id, r.score) for r in trending_rows]
+        fetched = session.execute(
+            select(Item).where(Item.item_id.in_(candidate_ids))
+        ).scalars().all()
+        item_map = {i.item_id: i for i in fetched}
 
     catalog_max_year = max((i.release_year for i in item_map.values()), default=None)
-    results = []
-    for item_id, raw_score in candidates:
+    scored = []
+
+    for item_id in candidate_ids:
         item = item_map.get(item_id)
         if not item or not item.is_active:
             continue
@@ -474,26 +573,40 @@ def _build_cold_start_response(session, user: User, limit: int) -> list[dict[str
             continue
         if MATURE_ORDER.get(item.maturity_rating, 0) > MATURE_ORDER.get(user.maturity_rating, 2):
             continue
-        trend_score = round(raw_score, 4)
-        freshness = round(item_freshness(item.release_year, reference_year=catalog_max_year), 4)
-        results.append({
+
+        trend_score = trending_scores.get(item_id, 0.0)
+        freshness = item_freshness(item.release_year, reference_year=catalog_max_year)
+        genre_bonus = min(
+            sum(genre_affinity.get(g.strip(), 0.0) for g in item.genres.split(",")) / 10.0,
+            1.0,
+        )
+        # Blend: trending dominates; genre affinity and freshness break ties for new users
+        blended = round(0.5 * trend_score + 0.3 * genre_bonus + 0.2 * freshness, 4)
+        components = {
+            "trending": round(trend_score, 4),
+            "freshness": round(freshness, 4),
+            "genre_bonus": round(genre_bonus, 4),
+            "collaborative": 0.0,
+            "content": 0.0,
+            "session": 0.0,
+        }
+        reason = max(
+            ("trending", trend_score * 0.5),
+            ("genre_bonus", genre_bonus * 0.3),
+            ("freshness", freshness * 0.2),
+            key=lambda t: t[1],
+        )[0]
+        scored.append({
             "item_id": item.item_id,
             "title": item.title,
             "genres": item.genres.split(","),
-            "score": trend_score,
-            "reason": "trending",
-            "components": {
-                "collaborative": 0.0,
-                "content": 0.0,
-                "session": 0.0,
-                "trending": trend_score,
-                "freshness": freshness,
-                "genre_bonus": 0.0,
-            },
+            "score": blended,
+            "reason": reason,
+            "components": components,
         })
-        if len(results) >= limit:
-            break
-    return results
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +620,11 @@ class FeedbackEvent(BaseModel):
     watch_seconds: int = 0
     completion_pct: float = 0.0
     position: int = -1
+
+class ExperimentConclude(BaseModel):
+    winning_variant: str = Field(..., pattern="^(control|variant|inconclusive)$")
+    conclusion_reason: str = Field(default="manual", max_length=32)
+
 
 class ExperimentCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
@@ -555,6 +673,7 @@ def recommendations(
     context: str = Query(default="home"),
     limit: int = Query(default=settings.recommendation_limit_default, ge=1, le=25),
     offset: int = Query(default=0, ge=0),
+    device_type: str | None = Query(default=None),
 ):
     started = time.perf_counter()
     RECOMMENDATION_REQUESTS.labels(context=context).inc()
@@ -569,8 +688,12 @@ def recommendations(
         # watched: ZSET keyed by timestamp — fetch all items watched within the rolling window
         watched: set[str] = set(redis_client.zrange(f"watched:{user_id}", 0, -1))
 
-        # Per-segment weights: use user's region for personalised signal blend
-        weights = _load_ranking_weights(session, segment=user.region)
+        # Priority: device-type weights → region weights → global weights
+        weights = _load_ranking_weights(
+            session,
+            segment=user.region,
+            primary=f"device:{device_type}" if device_type else None,
+        )
         experiment_info: dict | None = None
 
         experiment = _load_active_experiment(session)
@@ -681,9 +804,39 @@ def list_experiments():
                 "variant_weights": json.loads(r.variant_weights or "{}"),
                 "is_active": r.is_active,
                 "created_at": r.created_at.isoformat(),
+                "max_duration_days": r.max_duration_days,
+                "concluded_at": r.concluded_at.isoformat() if r.concluded_at else None,
+                "winning_variant": r.winning_variant,
+                "conclusion_reason": r.conclusion_reason,
             }
             for r in rows
         ]
+
+
+@app.post("/experiments/{name}/conclude", status_code=200, dependencies=[Depends(_verify_api_key)])
+def conclude_experiment(name: str, body: ExperimentConclude):
+    """Manually conclude an experiment, recording the winner and reason."""
+    from datetime import datetime, timezone
+    with SessionLocal() as session:
+        experiment = session.get(Experiment, name)
+        if not experiment:
+            raise HTTPException(status_code=404, detail=f"Experiment '{name}' not found")
+
+        experiment.is_active = False
+        experiment.concluded_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        experiment.winning_variant = body.winning_variant
+        experiment.conclusion_reason = body.conclusion_reason
+        session.commit()
+
+        with _exp_lock:
+            _exp_cache["ts"] = 0.0
+
+    return {
+        "name": name,
+        "is_active": False,
+        "winning_variant": body.winning_variant,
+        "conclusion_reason": body.conclusion_reason,
+    }
 
 
 @app.delete("/experiments/{name}", status_code=200, dependencies=[Depends(_verify_api_key)])

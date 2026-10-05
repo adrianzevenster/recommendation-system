@@ -26,6 +26,7 @@ from sklearn.preprocessing import StandardScaler, normalize as sklearn_normalize
 from sqlalchemy import delete, desc, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from common.ann import build_ann_index, serialize_index
 from common.config import settings
 from common.db import SessionLocal, engine
 from common.eval import (
@@ -45,12 +46,14 @@ from common.metrics import (
     ARTIFACTS_SAVED,
     ATTRIBUTED_WATCH_TIME_SECONDS,
     AVG_ATTRIBUTED_WATCH_SECONDS,
+    COMPLETION_RATE,
     EVAL_COVERAGE,
     EVAL_COVERAGE_DELTA,
     EVAL_HIT_RATE_AT_10,
     EVAL_MRR_AT_10,
     EVAL_NDCG_AT_10,
     EVAL_WATCH_TIME_NDCG_AT_10,
+    EVENT_VOLUME,
     MODELS_TRAINED,
     RETENTION_7DAY,
     TRAINING_DATA_QUALITY_FAILURES,
@@ -146,22 +149,25 @@ def build_mf_neighbors(
     interactions: list[Interaction],
     n_components: int = 50,
     top_k: int = 8,
-) -> list[tuple]:
+) -> tuple[list[tuple], dict[str, np.ndarray]]:
     """SVD matrix factorization → item-item similarity for enhanced collaborative signal.
 
     Complements co-occurrence CF by capturing latent factor structure that
     co-occurrence misses (e.g. items with sparse but high-quality overlap).
     Results are blended with co-occurrence scores in run_training_once().
+
+    Returns (neighbors, item_embeddings) where item_embeddings maps item_id
+    to its L2-normalised SVD factor — used to build the FAISS ANN index.
     """
     engagement_ixs = [ix for ix in interactions if ix.event_type in ENGAGEMENT_EVENTS]
     if not engagement_ixs:
-        return []
+        return [], {}
 
     user_ids = list(dict.fromkeys(ix.user_id for ix in engagement_ixs))
     item_ids = list(dict.fromkeys(ix.item_id for ix in engagement_ixs))
 
     if len(user_ids) < 5 or len(item_ids) < 5:
-        return []
+        return [], {}
 
     user_idx = {uid: i for i, uid in enumerate(user_ids)}
     item_idx = {iid: i for i, iid in enumerate(item_ids)}
@@ -176,7 +182,7 @@ def build_mf_neighbors(
         score_map[key] = max(score_map.get(key, 0.0), w)
 
     if not score_map:
-        return []
+        return [], {}
 
     rows_list = [k[0] for k in score_map]
     cols_list = [k[1] for k in score_map]
@@ -189,7 +195,7 @@ def build_mf_neighbors(
 
     n_comp = min(n_components, min(matrix.shape) - 1)
     if n_comp < 2:
-        return []
+        return [], {}
 
     svd = TruncatedSVD(n_components=n_comp, random_state=42)
     item_factors = svd.fit_transform(matrix.T)  # shape: (n_items, n_components)
@@ -209,7 +215,9 @@ def build_mf_neighbors(
             if sim > 0.0:
                 neighbors.append((iid, item_ids[int(j)], sim, "mf"))
 
-    return neighbors
+    # Return embeddings dict alongside neighbors for ANN index construction
+    embeddings = {item_ids[i]: item_factors[i] for i in range(len(item_ids))}
+    return neighbors, embeddings
 
 
 def build_content_neighbors(items: list[Item], top_k: int = 8):
@@ -406,6 +414,11 @@ def _validate_training_data(interactions: list, items: list) -> None:
     future_count = sum(1 for ix in interactions if ix.event_ts > future_cutoff)
     if future_count / len(interactions) > 0.01:
         raise ValueError(f"future_timestamps:{future_count}/{len(interactions)}")
+    # Distribution shift guard: very low completion rates indicate a broken event pipeline
+    play_starts = sum(1 for ix in interactions if ix.event_type == "play_start")
+    completes = sum(1 for ix in interactions if ix.event_type == "complete")
+    if play_starts >= 20 and completes / play_starts < 0.03:
+        raise ValueError(f"completion_rate_too_low:{completes}/{play_starts}")
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +433,33 @@ def _get_s3_client():
         aws_secret_access_key=settings.minio_secret_key,
         config=BotocoreConfig(signature_version="s3v4"),
     )
+
+
+def _save_ann_artifacts(version: str, ann_index, id_list: list[str]) -> None:
+    """Persist FAISS index + ID mapping to MinIO alongside other model artifacts."""
+    if ann_index is None or not id_list:
+        return
+    try:
+        client = _get_s3_client()
+        # FAISS binary
+        idx_bytes = serialize_index(ann_index)
+        client.put_object(
+            Bucket="models",
+            Key=f"trainer/{version}/ann_index.faiss",
+            Body=idx_bytes,
+            ContentLength=len(idx_bytes),
+        )
+        # ID list (JSON array — order must match FAISS row order)
+        id_bytes = json.dumps(id_list).encode()
+        client.put_object(
+            Bucket="models",
+            Key=f"trainer/{version}/ann_index_ids.json",
+            Body=id_bytes,
+            ContentLength=len(id_bytes),
+        )
+        logger.info("Saved ANN index to MinIO", extra={"version": version, "items": len(id_list)})
+    except Exception as exc:
+        logger.warning("Failed to save ANN index", extra={"error": str(exc)})
 
 
 def _save_model_artifacts(version: str, vectorizer, scaler, lr_model) -> None:
@@ -711,6 +751,94 @@ def _precompute_user_recommendations(
 
 
 # ---------------------------------------------------------------------------
+# A/B experiment auto-conclude
+# ---------------------------------------------------------------------------
+
+def _auto_conclude_experiments(session) -> None:
+    """Conclude A/B experiments that have run past their max_duration_days.
+
+    Runs a two-proportion z-test on engagements vs impressions.  If significant
+    (|z| >= 1.96) the winning side is recorded; otherwise the experiment is
+    marked inconclusive.  Only committed here — caller is responsible for the
+    surrounding session lifecycle.
+    """
+    import math as _math
+    from sqlalchemy import func
+
+    now = _utcnow()
+    active_exps = session.execute(
+        select(Experiment).where(Experiment.is_active.is_(True))
+    ).scalars().all()
+
+    _STRONG_ENGAGEMENT = frozenset({"play_start", "complete", "watchlist_add"})
+
+    for exp in active_exps:
+        elapsed_days = (now - exp.created_at).days
+        if elapsed_days < exp.max_duration_days:
+            continue
+
+        # Aggregate per (user_id, event_type) since the experiment started
+        agg_rows = session.execute(
+            select(
+                Interaction.user_id,
+                Interaction.event_type,
+                func.count().label("cnt"),
+            )
+            .where(
+                Interaction.event_ts >= exp.created_at,
+                Interaction.event_type.in_(["impression"] + list(_STRONG_ENGAGEMENT)),
+            )
+            .group_by(Interaction.user_id, Interaction.event_type)
+        ).all()
+
+        ctrl = {"impressions": 0, "engagements": 0}
+        var_ = {"impressions": 0, "engagements": 0}
+
+        for row in agg_rows:
+            bucket = int(hashlib.md5(f"{row.user_id}:{exp.name}".encode()).hexdigest(), 16) % 100
+            side = var_ if bucket < exp.traffic_pct else ctrl
+            if row.event_type == "impression":
+                side["impressions"] += row.cnt
+            elif row.event_type in _STRONG_ENGAGEMENT:
+                side["engagements"] += row.cnt
+
+        n1, k1 = ctrl["impressions"], ctrl["engagements"]
+        n2, k2 = var_["impressions"], var_["engagements"]
+
+        is_significant = False
+        winning_variant = "inconclusive"
+        if n1 > 0 and n2 > 0:
+            p1, p2 = k1 / n1, k2 / n2
+            p_pool = (k1 + k2) / (n1 + n2)
+            if 0.0 < p_pool < 1.0:
+                se = _math.sqrt(p_pool * (1.0 - p_pool) * (1.0 / n1 + 1.0 / n2))
+                if se > 0.0:
+                    z = (p2 - p1) / se
+                    if abs(z) >= 1.96:
+                        is_significant = True
+                        winning_variant = "variant" if z > 0 else "control"
+
+        exp.is_active = False
+        exp.concluded_at = now
+        exp.winning_variant = winning_variant
+        exp.conclusion_reason = "significant" if is_significant else "max_duration"
+
+        logger.info(
+            "Auto-concluded experiment",
+            extra={
+                "experiment": exp.name,
+                "elapsed_days": elapsed_days,
+                "winning_variant": winning_variant,
+                "conclusion_reason": exp.conclusion_reason,
+                "ctrl_impressions": n1,
+                "var_impressions": n2,
+            },
+        )
+
+    session.commit()
+
+
+# ---------------------------------------------------------------------------
 # Training entry point
 # ---------------------------------------------------------------------------
 
@@ -731,6 +859,13 @@ def run_training_once() -> None:
                 select(Interaction).where(Interaction.event_ts >= lookback_cutoff)
             ).scalars().all()
 
+            # Emit distribution-shift gauges before the quality gate so alerts
+            # fire even when training is aborted by the low-completion-rate check.
+            _play_starts = sum(1 for ix in interactions if ix.event_type == "play_start")
+            _completes = sum(1 for ix in interactions if ix.event_type == "complete")
+            COMPLETION_RATE.set(_completes / _play_starts if _play_starts > 0 else 0.0)
+            EVENT_VOLUME.set(len(interactions))
+
             _validate_training_data(interactions, items)
 
             # Split BEFORE building neighbour graphs to prevent eval data from
@@ -739,7 +874,7 @@ def run_training_once() -> None:
 
             # --- Build signal models from train split only ---
             collaborative_cooc = build_collaborative_neighbors(train_ixs)
-            collaborative_mf = build_mf_neighbors(train_ixs)
+            collaborative_mf, item_embeddings = build_mf_neighbors(train_ixs)
             content, content_vectorizer = build_content_neighbors(items)
             # Trending is operational (time-windowed), not eval-sensitive — use all interactions
             trending = build_trending(interactions)
@@ -896,8 +1031,13 @@ def run_training_once() -> None:
             # Commit all DB changes before the (potentially slow) Redis precompute
             session.commit()
 
+            # Auto-conclude experiments that have exceeded their max_duration_days
+            _auto_conclude_experiments(session)
+
         # --- Save model artifacts to object storage (non-critical, outside session) ---
         _save_model_artifacts(version, content_vectorizer, scaler, lr)
+        ann_index, ann_id_list = build_ann_index(item_embeddings)
+        _save_ann_artifacts(version, ann_index, ann_id_list)
 
         # --- Update Prometheus gauges ---
         EVAL_NDCG_AT_10.set(eval_result["ndcg_at_k"])
